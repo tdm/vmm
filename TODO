@@ -1,0 +1,20 @@
+Need to do
+==========
+ - Implement user local-uid field
+ - Ensure daemon mode and logging work
+ - Save session tokens in run_dir
+ - Ensure thread locks are proper
+ - Add download/copy pct to image detail
+ - Track references to images and isos
+ - Add ability to modify user groups
+ - Use sqlite
+ - Finish API implementation
+ - Security checks for all operations
+
+Might do
+========
+ - Add option to convert vmdk -> qcow2
+ - Convert html to templates with:
+   %{varname}
+   %{!for varname}...%{!end}
+   %{!if varname}...%{!end}

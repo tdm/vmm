@@ -1,0 +1,93 @@
+#!/usr/bin/python3
+
+# vmm client
+
+import os
+import sys
+import errno
+import getopt
+import socket
+import ssl
+import select
+
+def usage():
+    print(""""Usage:
+  vmmc [ssl|raw:]<host>[:port]
+""")
+    sys.exit(1)
+
+def vmmc_connect(arg):
+    fields = arg.split(':')
+    use_ssl = True
+    host = None
+    port = 987
+    if len(fields) < 1 or len(fields) > 3:
+        usage()
+    if len(fields) >= 2:
+        if not fields[0] in ['raw', 'ssl']:
+            usage()
+        use_ssl = fields[0] == 'ssl'
+        fields = fields[1:]
+    if len(fields) == 2:
+        port = int(fields[1])
+        fields = fields[:1]
+    host = fields[0]
+    server_addr = (host, port)
+
+    sys.stdout.write("Connecting to vmm daemon at %s:%d ...\n" % (host, port))
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+        if use_ssl:
+            sys.stdout.write("Wrapping socket with SSL\n")
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+            ssl_ctx.load_default_certs()
+            ssl_ctx.options = ssl.OP_NO_TLSv1_3
+            ssl_ctx.check_hostname = False
+            #ssl_ctx.verify_mode = ssl.CERT_NONE
+            sock = ssl_ctx.wrap_socket(sock)
+        sock.connect(server_addr)
+    except BaseException as e:
+        sys.stderr.write("Failed to connect: %s\n" % (e))
+        sys.exit(1)
+    sys.stdout.write("Escape char is '^]'.\n")
+    running = True
+    os.system("stty raw -echo")
+    while running:
+        try:
+            (rfds, wfds, efds) = select.select([sock, sys.stdin], [], [])
+            if sock in rfds:
+                data = sock.recv(4096)
+                sys.stdout.buffer.write(data)
+                sys.stdout.flush()
+            if sys.stdin in rfds:
+                data = sys.stdin.buffer.read(1)
+                if data == b'\x1d':
+                    running = False
+                else:
+                    sock.send(data)
+        except BaseException as e:
+            sys.stdout.write("Connection lost: %s\r\n" % (e))
+            running = False
+    os.system("stty -raw echo")
+    sys.stdout.write('\n')
+
+# Main dispatcher
+
+global_opts = 'dhv'
+global_longopts = ['debug', 'help', 'version']
+options = {
+    'debug'  : False,
+    'help'   : False,
+    'verbose': False
+}
+optargs, argv = getopt.getopt(sys.argv[1:], global_opts, global_longopts)
+for k,v in optargs:
+    if k in ('-d', '--debug'):
+        options['debug'] = True
+    if k in ('-h', '--help'):
+        options['help'] = True
+    if k in ('-v', '--verbose'):
+        options['verbose'] = True
+if len(argv) != 1:
+    usage()
+vmmc_connect(argv[0])

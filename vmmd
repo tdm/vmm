@@ -1,0 +1,2501 @@
+#!/usr/bin/python3
+
+# API:
+#  - GET  /api/user
+#  - GET  /api/user?id=#
+#  - POST /api/user (id=#, action=<edit|delete|...> ...)
+#  - POST /api/user/create
+#
+#  - GET  /api/image
+#  - GET  /api/image?id=#
+#  - POST /api/image (id=# actions: delete)
+#  - POST /api/image/create (name, ...)
+#  - PUT  /api/image/create (header: X-Image-Name)
+#
+#  - GET  /api/vm
+#  - GET  /api/vm?id=#
+#  - POST /api/vm (id=# actions: delete, start, reset, suspend, restore, poweroff, kill)
+#  - POST /api/vm/create (arch, cpus, mem, disk, ...)
+
+# Global configuration:
+#   network.mode=<none | manual | bridge> { manual }
+#   network.bridge.name=<name> { br0 }
+#   network.bridge.mode=<manual | subnet | nat> { subnet |
+#   network.bridge.addr=<ipaddr> { 172.16.1.1/24 }
+#   network.dhcp.start=<ipaddr> { based on bridge addr }
+#   network.dhcp.end=<ipaddr> { based on bridge addr }
+#
+#   nic.mac.start=<macaddr> { 52:54:00:00:00:00 }
+#
+#   iso.storage.location=<path> { /var/lib/vmm/isos }
+#   image.storage.location=<path> { /var/lib/vmm/images }
+#
+#   disk.storage.type=<dir | lvm> { dir }
+#   disk.storage.location=<path | name> { /var/lib/vmm/disk | vg0 }
+#   disk.storage.name=<format> { %u.%n }
+#
+#   vm.nesting=<bool> { true }
+#   vm.max_cpu { none }
+#   vm.max_mem { none }
+#   vm.max_disk { none }
+#
+#   user.max_cpu { none }
+#   user.max_mem { none }
+#   user.max_disk { none }
+#
+# Notes:
+#   Storage:
+#     For storage.name has the following replacments:
+#       %n = vm name
+#       %u = user name
+#       %g = group name
+#       %U = user id
+#       %G = group id
+#
+# Limits:
+#   Max VM's per host: 16k (somewhat arbitrary)
+#     Max ports available for VNC is about 60000.
+#     At 4gb per VM, 16k VM's takes 64tb.
+#
+# TODO:
+#   Need either daemon or suid script to manage VM IDs and resource limits.
+#
+# Daemon
+# ======
+# name: vmmd (Virtual Machine Manager Daemon)
+# config: /etc/vmm/config
+# database: /var/lib/vmm/database.json (json, xml, pickle, ...?)
+# state: /var/lib/vmm/state.json (json, xml, pickle, ...?)
+#
+# VM configuration in database:
+#   - ID
+#   - CPU count
+#   - Memory
+#   - Other hardware? USB, NIC model, cdrom image, ...?
+
+import os
+import sys
+import platform
+import errno
+import getopt
+import pwd
+import hashlib
+import random
+import threading
+import subprocess
+import signal
+import time
+import syslog
+import signal
+import socket
+import select
+import json
+import http.server
+import ssl
+import urllib.parse
+import urllib.request
+
+import email.parser
+import email.policy
+#import sqlite3
+
+import traceback
+
+ONE_KB = 1 << 10
+ONE_MB = 1 << 20
+ONE_GB = 1 << 30
+ONE_TB = 1 << 40
+
+### Globals ###
+
+log_dir = '/var/log'
+log_debug = False
+log_verbose = 0
+
+state_dir = '/var/lib/vmm'
+run_dir = '/var/run/vmm'
+
+options = None
+config = None
+
+uid = os.getuid()
+gid = os.getgid()
+pid = os.getpid()
+tmp_dir = os.environ.get('TMPDIR', '/tmp')
+
+user_db = None
+image_db = None
+vm_db = None
+
+### Misc utilities ###
+
+def is_int(v):
+    try:
+        int(v)
+    except ValueError:
+        return False
+    return True
+def to_int(v):
+    return int(v)
+
+num_suffixes = {
+    'k': 1 << 10, 'K': 1 << 10,
+    'm': 1 << 20, 'M': 1 << 20,
+    'g': 1 << 30, 'G': 1 << 30,
+    't': 1 << 40, 'T': 1 << 40
+}
+
+def is_num(v):
+    idx = 0
+    while idx < len(v) and v[idx].isdigit():
+        idx += 1
+    if idx < len(v):
+        return v[idx:] in num_suffixes
+    return True
+def to_num(v):
+    idx = 0
+    while idx < len(v) and v[idx].isdigit():
+        idx += 1
+    if idx < len(v):
+        num = int(v[:idx])
+        suffix = v[idx:]
+        if not suffix in num_suffixes:
+            raise RuntimeError('Bad numeric suffix')
+        return num * num_suffixes[suffix]
+    return int(v)
+
+def is_float(v):
+    try:
+        float(v)
+    except ValueError:
+        return False
+    return True
+def to_float(v):
+    return float(v)
+
+bool_t_values = [ 'true',  'yes', 'on' ]
+bool_f_values = [ 'false', 'no',  'off' ]
+def is_bool(v):
+    return v.lower() in bool_t_values + bool_f_values
+def to_bool(v):
+    return v.lower() in bool_t_values
+
+def autotype(v):
+    if not v:
+        return ''
+    if is_int(v):
+        return to_int(v)
+    if is_num(v):
+        return to_num(v)
+    if is_float(v):
+        return to_float(v)
+    if is_bool(v):
+        return to_bool(v)
+    return str(v)
+
+def readable_size(val, scale=1):
+    if val is None:
+        return 'Unknown'
+    n = val * scale
+    if n < 1000 * (1 << 10):
+        d = (1 << 10)
+        m = 'KB'
+    elif n < 1000 * (1 << 20):
+        d = (1 << 20)
+        m = 'MB'
+    elif n < 1000 * (1 << 30):
+        d = (1 << 30)
+        m = 'GB'
+    else:
+        d = (1 << 40)
+        m = 'TB'
+    i = (n / d)
+    f = (n - (i * d)) / (d / 100)
+    return "%d.%02d %s" % (i, f, m)
+
+def readable_time(val):
+    h = val / 3600
+    val -= h * 3600
+    m = val / 60
+    val -= m * 60
+    s = val
+    if h > 0:
+        return "%d:%02d:%02d" % (h, m, s)
+    elif m > 0:
+        return "%02d:%02d" % (m, s)
+    else:
+        return ":%02d" % (s)
+
+def parse_num(strval):
+    idx = 0
+    while idx < len(strval) and strval[idx].isdigit():
+        idx += 1
+    if idx < len(strval):
+        factors = {
+            'k': 1 << 10, 'kb': 1 << 10,
+            'm': 1 << 20, 'mb': 1 << 20,
+            'g': 1 << 30, 'gb': 1 << 30,
+            't': 1 << 40, 'tb': 1 << 40,
+        }
+        num = int(strval[:idx])
+        suffix = strval[idx:].lower().strip()
+        if not suffix in factors:
+            raise RuntimeError('Bad numeric suffix')
+        return num * factors[suffix]
+    return int(strval)
+
+def mkdir_p(path, mode=None):
+    parent = os.path.dirname(path)
+    if parent and parent != '/':
+        mkdir_p(parent, mode)
+    try:
+        if mode is None:
+            os.mkdir(path)
+        else:
+            os.mkdir(path, mode)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+def sha256_bytes(val):
+    hasher = hashlib.sha256()
+    hasher.update(val)
+    return hasher.hexdigest()
+
+def sha256_string(val):
+    return sha256_bytes(val.encode())
+
+def file_write(pathname, buf):
+    f = open(pathname, 'w')
+    f.write(buf)
+    f.close()
+
+def file_delete(pathname):
+    try:
+        os.unlink(pathname)
+    except OSError as e:
+        if e.errno != errno.ENOENT:
+            raise
+
+def file_install(pathname, buf, mode=None):
+    mkdir_p(os.path.dirname(pathname))
+    f = open(pathname, 'w')
+    f.write(buf)
+    f.close()
+    if not mode is None:
+        os.chmod(pathname, mode)
+
+def file_remove(pathname):
+    try:
+        os.unlink(pathname)
+    except OSError as e:
+        if e.errno != errno.ENOENT:
+            raise
+
+def image_pathname(root, name, ext):
+    pathname = "%s/%s" % (root, name)
+    if not pathname.endswith(ext):
+        pathname += ext
+    return pathname
+
+# XXX: cache results
+def find_in_path(name):
+    for dir in os.environ["PATH"].split(":"):
+        path = "%s/%s" % (dir, name)
+        if os.path.exists(path):
+            return path
+    raise OSError("%s not found in %s" % (name, os.environ["PATH"]))
+
+### Process utilities ###
+
+daemonized = False
+def daemonize():
+    global daemonized
+    pid = os.fork()
+    if pid > 0:
+        os._exit(0)
+    os.chdir('/')
+    os.umask(0o022)
+    nullfd = os.open('/dev/null', os.O_RDWR)
+    os.dup2(nullfd, 0)
+    os.dup2(nullfd, 1)
+    os.dup2(nullfd, 2)
+    os.close(nullfd)
+    pid = os.fork()
+    if pid > 0:
+        os._exit(0)
+    syslog.openlog(logoption=syslog.LOG_PID)
+    daemonized = True
+
+def pid_exists(pid):
+    if pid is None or pid < 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        if e.errno == errno.EPERM:
+            return True
+        return False
+    return True
+
+def pid_kill(pid, nofail=None, sig=None):
+    if nofail is None:
+        nofail = False
+    if sig is None:
+        sig = signal.SIGTERM
+    if pid <= 0:
+        return
+    try:
+        os.kill(pid, sig)
+    except OSError as e:
+        if not nofail:
+            raise
+
+def pidfile_read(name, path=None):
+    if path is None:
+        path = run_dir
+    pathname = "%s/%s.pid" % (path, name)
+    pid = 0
+    try:
+        f = open(pathname, 'r+')
+        line = f.readline()
+        f.close()
+        pid = int(line)
+    except:
+        pass
+    return pid
+
+def pidfile_write(name, path=None):
+    if path is None:
+        path = run_dir
+    pathname = "%s/%s.pid" % (path, name)
+    oldpid = 0
+    f = open(pathname, 'a+')
+    try:
+        line = f.readline()
+        oldpid = int(line)
+    except:
+        pass
+    if oldpid != 0 and pid_exists(oldpid):
+        f.close()
+        raise RuntimeError("Cannot write pidfile, %s already running with pid %d" % (name, oldpid))
+    f.seek(0)
+    f.truncate()
+    f.write("%d\n" % (os.getpid()))
+    f.close()
+
+def pidfile_remove(name, path=None):
+    if path is None:
+        path = run_dir
+    pathname = "%s/%s.pid" % (path, name)
+    try:
+        os.remove(pathname)
+    except:
+        pass
+
+def cmd_run(args, stdin=None):
+    logi("cmd_run: %s\n" % (args))
+    child = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if not stdin is None:
+        child.stdin.write(stdin)
+    (out, err) = child.communicate()
+    rc = child.returncode
+    if rc != 0:
+        raise RuntimeError("Failed to run \"%s\"" % (' '.join(args)))
+    return (out.decode(), err.decode())
+
+def fork_child(args):
+    logi("fork_child: %s" % (args))
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.execv(args[0], args)
+        except BaseException as e:
+            sys.stderr.write("os.execv raised %s\n" % (e))
+        sys.stderr.write("os.execv returned unexpectedly\n")
+        os._exit(0)
+    return pid
+
+### Logging utilities ###
+
+def logx(level, msg):
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    if not msg.endswith('\n'):
+        msg += '\n'
+    if log_debug:
+        sys.stderr.write(msg)
+    else:
+        f = open("%s/vmmd.log" % (log_dir), "a")
+        f.write("%s [%d] [%s] %s" % (now, os.getpid(), level, msg))
+        f.close()
+
+def logi(msg):
+    logx('info', msg)
+
+def logw(msg):
+    logx('warn', msg)
+
+def loge(msg):
+    logx('error', msg)
+
+def logv(msg):
+    if log_verbose > 0:
+        logx('debug', msg)
+
+### Signal handlers ###
+
+def sig_child(signum, frame):
+    try:
+        pid, status, usage = os.wait3(os.WNOHANG)
+        if pid == 0:
+            return
+        logi("Child pid %d exited with status %d\n" % (pid, status))
+    except:
+        pass
+
+### Config ###
+
+class Config:
+    def __init__(self, pathname=None, defaults=None):
+        if defaults:
+            self._config = defaults
+        else:
+            self._config = {}
+        if pathname:
+            self.load(pathname)
+
+    def load(self, pathname):
+        try:
+            f = open(pathname, 'r')
+        except IOError as e:
+            if e.errno == errno.ENOENT:
+                return
+            raise
+        for line in f:
+            i = line.find('#')
+            if i != -1:
+                line = line[:i]
+            line = line.strip()
+            if not line:
+                continue
+            append = False
+            if line.find('+=') != -1:
+                fields = line.split('+=', 1)
+                append = True
+            elif line.find('=') != -1:
+                fields = line.split('=', 1)
+            else:
+                fields = [line, 'true']
+
+            k = fields[0].strip()
+            v = autotype(fields[1].strip())
+            if append:
+                if k in self._config:
+                    if is_int(self._config[k]):
+                        self._config[k] += v
+                    else:
+                        self._config[k] += " %s" % (v)
+                else:
+                    self._config[k] = v
+            else:
+                self._config[k] = v
+
+    def __contains__(self, k):
+        return k in self._config
+
+    def __getitem__(self, k):
+        if not k in self._config:
+            raise KeyError(k)
+        return self._config[k]
+
+    def get(self, k, default=None):
+        if not k in self._config:
+            return default
+        return self._config[k]
+
+### ScopedLocker ###
+class ScopedLocker:
+    def __init__(self, lock):
+        self._lock = lock
+        self._lock.acquire()
+
+    def __del__(self):
+        self._lock.release()
+
+### DbObject ###
+class DbObject:
+    def __init__(self, oid):
+        if oid is None:
+            oid = 1
+            while oid in self.__class__._oid_map:
+                oid += 1
+        if oid in self.__class__._oid_map:
+            raise RuntimeError("Duplicate object in database")
+        self.__class__._oid_map.add(oid)
+        self._oid = oid
+        self._lock = threading.Lock()
+    def __del__(self):
+        self.__class__._oid_map.remove(self._oid)
+    def oid(self):
+        return self._oid
+
+### NamedObjectDatabase ###
+class NamedObjectDatabase:
+    def __init__(self, classobj, pathname=None):
+        self._lock = threading.Lock()
+        self._classobj = classobj
+        self._pathname = pathname
+        self._obj_by_oid = {}
+        self._obj_by_name = {}
+        if pathname:
+            self.load()
+
+    def load(self, pathname=None):
+        self._obj_by_oid = {}
+        self._obj_by_name = {}
+        if not pathname:
+            pathname = self._pathname
+        try:
+            f = open(pathname, 'r')
+        except IOError as e:
+            if e.errno == errno.ENOENT:
+                return
+            raise
+        try:
+            vec = json.load(f)
+        except json.decoder.JSONDecodeError as e:
+            os.remove(pathname)
+            return
+        f.close()
+        for elem in vec:
+            obj = self._classobj.deserialize(elem)
+            self._obj_by_oid[obj.oid()] = obj
+            self._obj_by_name[obj.name()] = obj
+
+    def save(self, pathname=None):
+        vec = []
+        for k,v in self._obj_by_oid.items():
+            vec.append(v.serialize())
+        if not pathname:
+            pathname = self._pathname
+        f = open(pathname, 'w')
+        json.dump(vec, f, indent=2)
+        f.close()
+
+    def items(self):
+        return self._obj_by_oid.items()
+
+    def length(self):
+        return len(self._obj_by_oid)
+    def empty(self):
+        return self.length() == 0
+    def get_by_oid(self, oid, default=None):
+        return self._obj_by_oid.get(oid, default)
+    def get_by_name(self, name, default=None):
+        return self._obj_by_name.get(name, default)
+    def insert(self, obj):
+        self._obj_by_oid[obj.oid()] = obj
+        self._obj_by_name[obj.name()] = obj
+        self.save()
+    def remove(self, obj):
+        del self._obj_by_oid[obj.oid()]
+        del self._obj_by_name[obj.name()]
+        self.save()
+
+### User ###
+class User(DbObject):
+    _oid_map = set()
+    _sessions = dict()
+    def __init__(self, oid, name, fullname, pwhash, groups, email, timezone, token, localuid):
+        DbObject.__init__(self, oid)
+        self._name = name
+        self._fullname = fullname
+        self._pwhash = pwhash
+        self._groups = groups
+        self._email = email
+        self._timezone = timezone
+        self._token = token
+        self._localuid = localuid
+    @staticmethod
+    def deserialize(args):
+        return User(args['oid'], args['name'], args['fullname'], args['pwhash'],
+                    args['groups'], args['email'], args['timezone'], args['token'],
+                    args['localuid'])
+    def serialize(self):
+        return {
+                'oid'     : self._oid,
+                'name'    : self._name,
+                'fullname': self._fullname,
+                'pwhash'  : self._pwhash,
+                'groups'  : self._groups,
+                'email'   : self._email,
+                'timezone': self._timezone,
+                'token'   : self._token,
+                'localuid': self._localuid
+        }
+    @staticmethod
+    def create(name, fullname, password, groups):
+        return User(None, name, fullname, sha256_string(password), groups, None, None, None, None)
+
+    def create_session(self):
+        self._session = sha256_string("%s%s%s" % (self.name(), self.pwhash(), time.time()))
+        User._sessions[self._session] = self
+        return self._session
+    def remove_session(self):
+        del User._sessions[self._session]
+        self._session = None
+    @staticmethod
+    def get_from_session(session):
+        return User._sessions.get(session, None)
+
+    def name(self):
+        return self._name
+    def fullname(self, val=None):
+        if not val is None:
+            self._fullname = val
+        return self._fullname
+    def pwhash(self):
+        return self._pwhash
+    def password(self, val):
+        self._pwhash = sha256_string(val)
+    def groups(self, val=None):
+        if not val is None:
+            self._groups = val
+        return self._groups
+    def email(self, val=None):
+        if not val is None:
+            self._email = val
+        return self._email
+    def timezone(self, val=None):
+        if not val is None:
+            self._timezone = val
+        return self._timezone
+    def token(self, val=None):
+        if not val is None:
+            self._token = val
+        return self._token
+    def localuid(self, val=None):
+        if not val is None:
+            self._localuid = val
+        return self._localuid
+
+    def auth_password(self, password):
+        pwhash = sha256_string(password)
+        return pwhash == self._pwhash
+
+    def in_group(self, group):
+        return group in self._groups
+
+    def may_access_file(self, pathname):
+        if not self.localuid():
+            return False
+        sb = os.stat(pathname)
+        return sb.st_uid == self._localuid
+
+### Image ###
+class Image(DbObject):
+    TYPE_NONE = 0
+    TYPE_ISO = 1
+    TYPE_DISK = 2
+    _oid_map = set()
+    def __init__(self, oid, name, pathname, owner, public=False, type_name=None):
+        DbObject.__init__(self, oid)
+        self._name = name
+        self._pathname = pathname
+        self._copy_status = None
+        self._owner = owner
+        self._public = public
+        self._type = Image.TYPE_NONE
+        if not type_name:
+            (base, ext) = os.path.splitext(pathname)
+            if ext.lower() in ['.iso']:
+                type_name = 'iso'
+            if ext.lower() in ['.qcow2', '.vmdk']:
+                type_name = 'disk'
+        if type_name.lower() == 'iso':
+            self._type = Image.TYPE_ISO
+        if type_name.lower() == 'disk':
+            self._type = Image.TYPE_DISK
+        self._ref = 0
+        self._size = None
+    @staticmethod
+    def deserialize(args):
+        owner = user_db.get_by_name(args['owner'])
+        return Image(args['oid'], args['name'],
+                     args['pathname'], owner, args['public'], args['type'])
+    def serialize(self):
+        return {
+                'oid'     : self._oid,
+                'name'    : self._name,
+                'pathname': self._pathname,
+                'owner'   : self._owner.name(),
+                'public'  : self._public,
+                'type'    : self.type_name()
+        }
+
+    @staticmethod
+    def create_from_local(name, pathname, user, public):
+        return Image(None, name, pathname, user, public)
+
+    @staticmethod
+    def create_from_upload(name, filename, data, user, public):
+        if filename.endswith('.iso'):
+            pathname = "%s/%s" % (config['iso.storage.location'], filename)
+        else:
+            pathname = "%s/%s" % (config['image.storage.location'], filename)
+        f = open(pathname, 'wb')
+        f.write(data)
+        f.close()
+        return Image.create_from_local(name, pathname, user, public)
+
+    @staticmethod
+    def create_from_url(name, url, user, public):
+        if url.endswith('.iso'):
+            pathname = "%s/%s" % (config['iso.storage.location'], os.path.basename(url))
+        else:
+            pathname = "%s/%s" % (config['image.storage.location'], os.path.basename(url))
+        img = Image(None, name, pathname, user, public)
+        print("Image: add %s to fetch queue" % (url))
+        file_copy_async(url, None, pathname, img)
+        return img
+
+    @staticmethod
+    def create_from_vmdisk(name, vm, user, public):
+        filename = os.path.basename(vm.disk_pathname())
+        pathname = "%s/%s" % (config['image.storage.location'], filename)
+        img = Image(None, name, pathname, user, public)
+        file_copy_async(vm.disk_pathname(), vm, img.pathname(), img)
+        return img
+
+    def name(self, val=None):
+        if not val is None:
+            self._name = val
+        return self._name
+    def pathname(self):
+        return self._pathname
+    def copying(self, val=None):
+        if not val is None:
+            self._copy_status = 0 if val else None
+        return (not self._copy_status is None)
+    def copy_pct(self, val=None):
+        if not val is None:
+            self._copy_status = val
+        return self._copy_status if self._copy_status else 100
+    def owner(self):
+        return self._owner
+    def public(self, val=None):
+        if not val is None:
+            self._public = val
+        return self._public
+    def type(self):
+        return self._type
+    def type_name(self):
+        if self._type == Image.TYPE_ISO:
+            return 'iso'
+        if self._type == Image.TYPE_DISK:
+            return 'disk'
+        raise RuntimeError("Invalid image type: %s" % (self._type))
+    def extension(self):
+        (root, ext) = os.path.splitext(self._pathname)
+        return ext
+    def incref(self):
+        self._ref += 1
+    def decref(self):
+        assert self._ref > 0
+        self._ref -= 1
+    def size(self):
+        if self._size is None:
+            try:
+                sb = os.stat(self._pathname)
+                self._size = sb.st_size / ONE_MB
+            except OSError as e:
+                pass
+        return self._size
+
+### VirtualMachine ###
+class VirtualMachine(DbObject):
+    _oid_map = set()
+    def __init__(self, oid, name, owner, arch, cpus, mem, mac_addr, disk_pathname):
+        DbObject.__init__(self, oid)
+        if mac_addr is None:
+            # XXX: make this better
+            allocated = set()
+            for oid, vm in vm_db.items():
+                allocated.add(vm._mac_addr)
+            found = False
+            while not found:
+                b4 = int(random.random() * 256)
+                b5 = int(random.random() * 256)
+                b6 = int(random.random() * 256)
+                mac_addr = "52:54:00:%02x:%02x:%02x" % (b4, b5, b6)
+                if not mac_addr in allocated:
+                    found = True
+        self._name = name
+        self._owner = owner
+        self._arch = arch
+        self._cpus = cpus
+        self._mem = mem
+        self._disk_pathname = disk_pathname
+        self._disk_size = None
+        self._copy_status = None
+        self._mac_addr = mac_addr
+        self._pid = self._get_qemu_pid()
+        self._iso_pathname = self._get_iso_pathname()
+        self._ipv4addr = None
+        self._ipv6addr = None
+
+    @staticmethod
+    def pathname_for_disk(username, vmname, ext):
+        return "%s/%s.%s%s" % (config['disk.storage.location'], username, vmname, ext)
+
+    @staticmethod
+    def create_new(name, owner, arch, cpus, mem, disk_size):
+        # XXX: deal with LVM
+        disk_pathname = VirtualMachine.pathname_for_disk(owner.name(), name, '.qcow2')
+        argv = [find_in_path('qemu-img'), 'create',
+                '-f', 'qcow2',
+                '-o', 'preallocation=metadata',
+                disk_pathname, "%dG" % (disk_size)]
+        cmd_run(argv)
+        return VirtualMachine(None, name, owner, arch, cpus, mem, None, disk_pathname)
+
+    @staticmethod
+    def create_from_image(name, owner, arch, cpus, mem, image_oid):
+        # XXX: deal with LVM
+        img = image_db.get_by_oid(image_oid)
+        if img.type() != Image.TYPE_DISK:
+            raise RuntimeError("Image is not a disk")
+        disk_pathname = VirtualMachine.pathname_for_disk(owner.name(), name, img.extension())
+        vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, disk_pathname)
+        if img.extension() == '.qcow2':
+            argv = [find_in_path('qemu-img'), 'create', '-f', 'qcow2', '-b', img.pathname(), disk_pathname]
+            cmd_run(argv)
+        else:
+            file_copy_async(img.pathname(), img, vm.disk_pathname(), vm)
+        return vm
+
+    @staticmethod
+    def create_from_local(name, owner, arch, cpus, mem, pathname):
+        return VirtualMachine(None, name, owner, arch, cpus, mem, None, pathname)
+
+    @staticmethod
+    def create_from_upload(name, owner, arch, cpus, mem, filename, data):
+        pathname = "%s/%s" % (config['disk.storage.location'], filename)
+        f = open(pathname, 'wb')
+        f.write(data)
+        f.close()
+        return VirtualMachine.create_from_local(name, owner, arch, cpus, mem, pathname)
+
+    @staticmethod
+    def create_from_url(name, owner, arch, cpus, mem, image_url):
+        # XXX: deal with LVM
+        (root, ext) = os.path.splitext(image_url)
+        disk_pathname = VirtualMachine.pathname_for_disk(owner.name(), name, ext)
+        vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, disk_pathname)
+        file_copy_async(image_url, None, disk_pathname, vm)
+        return vm
+
+    @staticmethod
+    def deserialize(args):
+        if not 'disk_pathname' in args:
+            args['disk_pathname'] = "%s/%s.qcow2" % (config['disk.storage.location'], args['name'])
+        return VirtualMachine(args['oid'], args['name'],
+                              user_db.get_by_name(args['owner']),
+                              args['arch'], args['cpus'], args['mem'],
+                              args.get('mac_addr', None),
+                              args['disk_pathname'])
+    def serialize(self):
+        return {
+                'oid'  : self._oid,
+                'name' : self._name,
+                'owner': self._owner.name(),
+                'arch' : self._arch,
+                'cpus' : self._cpus,
+                'mem'  : self._mem,
+                'mac_addr': self._mac_addr,
+                'disk_pathname' : self._disk_pathname,
+        }
+
+    def _qemu_pidfile(self):
+        return "%s/%04x/qemu.pid" % (run_dir, self.oid())
+    def _get_qemu_pid(self):
+        try:
+            f = open(self._qemu_pidfile(), 'r')
+            buf = f.read()
+            f.close()
+            return int(buf.strip())
+        except BaseException as e:
+            return None
+    def _get_iso_pathname(self):
+        pathname = None
+        if self.running():
+            lines = self._run_monitor_command('info block ide1-cd0')
+            for line in lines:
+                if line.startswith('ide1-cd0'):
+                    fields = line.split(':', 1)
+                    pathname = fields[1].strip().split(' ')[0]
+                    if pathname.startswith('['):
+                        pathname = None
+        return pathname
+
+    # Return list of snapshots as (id, tag).  Disk must not be in use.
+    def _snapshot_list(self):
+        snapshots = []
+        if self._disk_pathname.endswith('.qcow2'):
+            argv = [find_in_path('qemu-img'), 'snapshot', '-l', self._disk_pathname]
+            (out, err) = cmd_run(argv)
+            for line in out.rstrip('\n').split('\n'):
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                if fields[0] == 'ID':
+                    continue
+                snapshots.append((fields[0], fields[1]))
+        return snapshots
+    def _has_snapshot_tag(self, tag):
+        snapshots = self._snapshot_list()
+        for item in snapshots:
+            if item[1] == tag:
+                return True
+        return False
+
+    def name(self, val=None):
+        if not val is None:
+            self._name = val
+        return self._name
+    def owner(self):
+        return self._owner
+    def arch(self):
+        return self._arch
+    def cpus(self, val=None):
+        if not val is None:
+            self_cpus = val
+        return self._cpus
+    def mem(self, val=None):
+        if not val is None:
+            self._mem = val
+        return self._mem
+    def disk_pathname(self):
+        return self._disk_pathname
+    def disk_size(self):
+        if self._disk_size is None:
+            try:
+                sb = os.stat(self._disk_pathname)
+                self._disk_size = sb.st_size / ONE_MB
+            except OSError as e:
+                pass
+        return self._disk_size
+    def copying(self, val=None):
+        if not val is None:
+            self._copy_status = 0 if val else None
+        return (not self._copy_status is None)
+    def copy_pct(self, val=None):
+        if not val is None:
+            self._copy_status = val
+        return self._copy_status if self._copy_status else 100
+    def macaddr(self):
+        return self._mac_addr
+
+    def running(self):
+        return not self._pid is None
+    def pid(self):
+        return self._pid
+    def state(self):
+        if self.running():
+            return 'running'
+        return 'stopped'
+
+    def iso_pathname(self):
+        return self._iso_pathname
+    def ipv4addr(self, addr=None):
+        locker = ScopedLocker(self._lock)
+        if not addr is None:
+            self._ipv4addr = addr
+        return self._ipv4addr
+    def start(self, **kwargs):
+        if self.copying():
+            raise RuntimeError("Cannot start while copying")
+        force_readonly = self.disk_pathname().endswith('.vmdk')
+        readonly = force_readonly or kwargs.get('readonly', False)
+        if force_readonly and not readonly:
+            raise RuntimeError("VMDK disks must be read-only")
+        resuming = (not readonly) and self._has_snapshot_tag('vmm-suspend')
+        prog = "qemu-system-%s" % (self._arch)
+        vm_run_dir = "%s/%04x" % (run_dir, self.oid())
+        mkdir_p(vm_run_dir)
+        argv = [find_in_path(prog)]
+        argv.extend(['-daemonize', '-pidfile', self._qemu_pidfile()])
+        if platform.machine() != 'x86_64' or self._arch != 'x86_64':
+            raise RuntimeError("Implement non-x64 support")
+        machine_arg = 'pc,accel=kvm'
+        cpu_arg = 'host' if config['vm.nesting'] else 'qemu64'
+        argv.extend(['-machine', machine_arg, '-cpu', cpu_arg])
+        argv.extend(['-smp', str(self._cpus),
+                '-m', "%dM" % self._mem,
+                '-monitor', "unix:%s/monitor,server,nowait" % (vm_run_dir),
+                '-serial', "unix:%s/serial,server,nowait" % (vm_run_dir),
+                '-vnc', ":%d" % (self.oid()),
+                '-usb',
+                '-device', 'usb-tablet',
+                '-netdev', "bridge,br=%s,id=net1" % (config['network.bridge.name']),
+                '-device', "e1000,netdev=net1,mac=%s" % (self.macaddr())])
+        if readonly:
+            argv.extend(['-drive', "file=%s,snapshot=on" % (self._disk_pathname)])
+        else:
+            argv.extend(['-drive', "file=%s" % (self._disk_pathname)])
+        if self._iso_pathname:
+            # XXX? -drive media=cdrom,file=%s
+            argv.extend(['-cdrom', self._iso_pathname, '-boot', 'd'])
+        if resuming:
+            argv.extend(['-loadvm', 'vmm-suspend'])
+        fork_child(argv)
+        tries = 0
+        while tries < 20 and not os.path.exists(self._qemu_pidfile()):
+            tries += 1
+            time.sleep(0.1)
+        if not os.path.exists(self._qemu_pidfile()):
+            print("Timed out waiting for pidfile")
+            raise RuntimeError("Emulator failed to start")
+        self._pid = self._get_qemu_pid()
+        print("pid=%d" % (self._pid))
+        if resuming:
+            self._run_monitor_command('delvm vmm-suspend')
+
+    def _drain_monitor_socket(self, sock):
+        buf = ''
+        while not buf.endswith('\n(qemu) '):
+            buf += sock.recv(4096).decode()
+        lines = buf.rstrip('\n').replace('\r', '').split('\n')
+        return lines
+
+    def _run_monitor_command(self, cmd):
+        locker = ScopedLocker(self._lock)
+        vm_run_dir = "%s/%04x" % (run_dir, self.oid())
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect("%s/monitor" % (vm_run_dir))
+        except:
+            print("mon: failed to connect")
+            return []
+        self._drain_monitor_socket(sock)
+        line = cmd
+        if not line.endswith('\n'):
+            line += '\n'
+        sock.send(line.encode())
+        return self._drain_monitor_socket(sock)
+
+    def iso_pathname(self):
+        return self._iso_pathname
+    def iso_eject(self):
+        if self.running():
+            self._run_monitor_command('eject ide1-cd0')
+        self._iso_pathname = None
+    def iso_insert(self, iso_pathname):
+        self.iso_eject()
+        self._iso_pathname = iso_pathname
+        if self.running():
+            self._run_monitor_command("change ide1-cd0 %s" % (self._iso_pathname))
+
+    def reset(self):
+        self._run_monitor_command('system_reset')
+
+    def suspend(self):
+        self._run_monitor_command('savevm vmm-suspend')
+        self.kill()
+
+    def poweroff(self):
+        self._run_monitor_command('system_powerdown')
+
+    def kill(self):
+        if self.running():
+            os.kill(self._pid, signal.SIGTERM)
+            tries = 0
+            while tries < 10 and self._pid:
+                time.sleep(0.1)
+
+    # Used by sig_child()
+    def notify_stopped(self):
+        try:
+            os.unlink(self._qemu_pidfile())
+        except OSError:
+            pass
+        self._pid = None
+
+### CliClientConnectionHandler and listener ###
+
+class CliClientConnectionHandler(threading.Thread):
+
+    def __init__(self, sock, secure):
+        # XXX: This should not be instance data
+        self._dispatch_table = {
+            'login':	self.cmd_login,
+            'serial':	self.cmd_serial,
+            'monitor':	self.cmd_monitor,
+            'help':	self.cmd_help
+        }
+
+        threading.Thread.__init__(self)
+        self._sock = sock
+        self._secure = secure
+        self._user = None
+
+    # Override
+    def run(self):
+        buf = ''
+        try:
+            while True:
+                self._sock.send('vmm> '.encode())
+                while buf.find('\n') == -1:
+                    data = self._sock.recv(4096)
+                    if not data:
+                        return
+                    for ch in data.decode():
+                        if ch == '\x7f':
+                            if len(buf) > 0:
+                                buf = buf[:-1]
+                            self._sock.send(b'\x08 \x08')
+                            continue
+                        if ch == '\r' or ch == '\n':
+                            buf += '\n'
+                            self._sock.send(b'\r\n')
+                            continue
+                        self._sock.send(ch.encode())
+                        buf += ch
+                idx = buf.find('\n')
+                while idx != -1:
+                    line = buf[:idx]
+                    buf = buf[idx+1:]
+                    idx = buf.find('\n')
+                    fields = line.split()
+                    if not fields:
+                        continue
+                    cmd = fields[0]
+                    args = fields[1:]
+                    if cmd == 'q' or cmd == 'quit':
+                        raise BrokenPipeError('Client quit')
+                    if not self._user and not cmd in ['login', 'help']:
+                        self.send_msg('-Unauthorized')
+                        continue
+                    if not cmd in self._dispatch_table:
+                        self.send_msg('-Unknown command')
+                        continue
+                    msg = self._dispatch_table[cmd](args)
+                    self.send_msg(msg)
+        except BaseException as e:
+            loge("Exception handling client: %s" % (e))
+
+    def send_msg(self, msg):
+        buf = "%s\r\n" % (msg)
+        self._sock.send(buf.encode())
+
+    def cmd_login(self, args):
+        if len(args) != 2:
+            return '-Invalid usage'
+        if is_int(args[0]):
+            user = user_db.get_by_oid(int(args[0]))
+        else:
+            user = user_db.get_by_name(args[0])
+        if len(args[1]) == 256/8*2:
+            if user.pwhash() != args[1]:
+                return '-Unauthorized'
+        else:
+            if not self._secure or not user.auth_password(args[1]):
+                return '-Unauthorized'
+        self._user = user
+        return '+ok'
+
+    def _cmd_passthru(self, name, args):
+        if len(args) != 1:
+            return '-Invalid usage'
+        if is_int(args[0]):
+            vm = vm_db.get_by_oid(int(args[0]))
+        else:
+            vm = vm_db.get_by_name(args[0])
+        if vm.owner().name() != self._user.name() and not self._user.in_group('admin'):
+            return '-Unauthorized'
+        self.send_msg("Connecting to %s ...\n" % (vm.name()))
+        vm_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        vm_sock.connect("%s/%04x/%s" % (run_dir, vm.oid(), name))
+        self.send_msg("Escape char is '^['\n")
+        try:
+            while True:
+                (rfds, wfds, efds) = select.select([self._sock, vm_sock], [], [])
+                if vm_sock in rfds:
+                    buf = vm_sock.recv(4096)
+                    self._sock.send(buf)
+                if self._sock in rfds:
+                    buf = self._sock.recv(4096)
+                    idx = buf.find(b'\x1b')
+                    if idx != -1:
+                        vm_sock.send(buf[:idx])
+                        break
+                    vm_sock.send(buf)
+        except BrokenPipeError as e:
+            self.send_msg("Connection lost")
+        return '+ok'
+
+    def cmd_serial(self, args):
+        return self._cmd_passthru('serial', args)
+
+    def cmd_monitor(self, args):
+        return self._cmd_passthru('monitor', args)
+
+    def cmd_help(self, args):
+        self.send_msg('login <name|id> <password|token>')
+        self.send_msg('serial <name|id>')
+        self.send_msg('monitor <name|id>')
+        self.send_msg('help')
+        return '+ok'
+
+def raw_cli_listener():
+    listen_addr = (config['cli.listen.address'], config['cli.listen.port'])
+    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+    raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    raw_sock.bind(listen_addr)
+    server_sock = raw_sock
+    server_sock.listen()
+    running = True
+    while running:
+        try:
+            conn, addr = server_sock.accept()
+            thread = CliClientConnectionHandler(conn, False)
+            thread.start()
+        except BaseException as e:
+            loge("Exception in raw_cli_listener: %s" % (e))
+
+def ssl_cli_listener():
+    listen_addr = (config['cli.listen.ssladdress'], config['cli.listen.sslport'])
+    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+    raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    raw_sock.bind(listen_addr)
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+    ssl_ctx.options = ssl.OP_NO_TLSv1_3
+    ssl_ctx.check_hostname = False
+    ssl_ctx.load_cert_chain(config['ssl.certfile'])
+    server_sock = ssl_ctx.wrap_socket(raw_sock, server_side=True)
+    server_sock.listen()
+    running = True
+    while running:
+        try:
+            conn, addr = server_sock.accept()
+            thread = CliClientConnectionHandler(conn, True)
+            thread.start()
+        except BaseException as e:
+            loge("Exception in ssl_cli_listener: %s" % (e))
+
+### HttpClientRequestHandler and http_listener ###
+
+class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
+    def __init__(self, request, client_address, server):
+        self._dispatch_table = {
+            '/api/v1/user':         self._api_v1_user,
+            '/api/v1/user/create':  self._api_v1_user_create,
+            '/api/v1/image':        self._api_v1_image,
+            '/api/v1/image/create': self._api_v1_image_create,
+            '/api/v1/vm':           self._api_v1_vm,
+            '/api/v1/vm/create':    self._api_v1_vm_create,
+
+            # XXX: Ensure aligned with API
+            # XXX: Add image manipulation (create/upload, delete)
+            '/ui':                  self.ui_overview,
+            '/ui/login':            self.ui_login,
+            '/ui/logout':           self.ui_logout,
+            '/ui/image':            self.ui_image,
+            '/ui/image/create':     self.ui_image_create,
+            '/ui/user':             self.ui_user,
+            '/ui/user/create':      self.ui_user_create,
+            '/ui/vm':               self.ui_vm,
+            '/ui/vm/create':        self.ui_vm_create
+        }
+        http.server.BaseHTTPRequestHandler.__init__(self, request, client_address, server)
+
+    # Override
+    def version_string(self):
+        return 'VirtualMachineManager/1.0'
+
+    def _send_response(self, code, headers, content):
+        encoded_content = content.encode() if content else None
+        self.send_response(code)
+        if headers:
+            for k,v in headers.items():
+                self.send_header(k, v)
+        if content:
+            if content.startswith('<'):
+                self.send_header('Content-Type', 'text/html')
+            else:
+                self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(encoded_content))
+        self.end_headers()
+        if encoded_content:
+            self.wfile.write(encoded_content)
+
+    def _api_v1_user(self, user, args):
+        is_admin = user.in_group('admin')
+        args_id = None
+        if 'id' in args:
+            args_id = int(args['id'][0])
+            if args_id != user.oid() and not is_admin:
+                self._send_response(403, None, json.dumps({'result': 403}))
+        if 'action' in args:
+            changed = False
+            if args['action'][0] == 'edit':
+                if 'fullname' in args:
+                    user.fullname(args['fullname'][0])
+                    changed = True
+                if 'password' in args:
+                    user.password(args['password'][0])
+                    changed = True
+                if 'email' in args:
+                    user.email(args['email'][0])
+            if args['action'][0] == 'delete':
+                if not user.is_admin:
+                    self._send_response(403, None, json.dumps({'result': 403}))
+                    return
+                user_db.remove(user)
+            if changed:
+                user_db.save()
+        r = json.dumps({
+            'result':   200,
+            'id':       user.oid(),
+            'name':     user.name(),
+            'fullname': user.fullname(),
+            'groups':   user.groups(),
+            'email':    user.email(),
+            'timezone': user.timezone()
+        })
+        self._send_response(200, None, r)
+
+    def _api_v1_user_create(self, user, args):
+        self._send_response(201, None, None)
+        pass
+
+    def _api_v1_image(self, user, args):
+        pass
+
+    def _api_v1_image_create(self, user, args):
+        pass
+
+    def _api_v1_vm(self, user, args):
+        pass
+
+    def _api_v1_vm_create(self, user, args):
+        pass
+
+    def _html_head(self, user=None):
+        r = ''
+        r += '<html>\n'
+        r += ' <head>\n'
+        r += '  <title>Virtual Machine Manager</title>\n'
+        r += ' </head>\n'
+        r += ' <body>\n'
+        r += ' <table width="100%">\n'
+        r += '  <tr>\n'
+        r += '   <td width="33%">&nbsp;\n'
+        r += '   <td width="33%" align="center"><img src="/ui/vmm.jpg" alt="logo">\n'
+        if user:
+            r += "   <td width=\"33%%\" align=\"right\" valign=\"top\">%s<br><a style=\"text-decoration:none\" href=\"/ui/logout\">logout</a>\n" % (user.fullname())
+        else:
+            r += '   <td width="33%">&nbsp;\n'
+        r += '  <tr>\n'
+        r += '   <td>&nbsp;\n'
+        r += '   <td align="center"><p style="font-size:150%">Virtual Machine Manager</p>\n'
+        r += '   <td>&nbsp;\n'
+        r += ' </table>\n'
+        r += ' <hr width="50%">\n'
+        if user:
+            r += ' <table width="100%">\n'
+            r += '  <tr>\n'
+            r += '   <td width="20%" style="vertical-align:top">\n'
+            if user.in_group('admin'):
+                r += '    <p style="color:red">Admin</p>\n'
+                r += '    <hr>\n'
+            r += '    <a style="text-decoration:none" href="/ui">Overview</a><br>\n'
+            r += '    <br>\n'
+            r += '    <a style="text-decoration:none" href="/ui/vm">Virtual Machines</a><br>\n'
+            r += '    <br>\n'
+            r += '    <a style="text-decoration:none" href="/ui/image?type=disk">Disk Images</a><br>\n'
+            r += '    <br>\n'
+            r += '    <a style="text-decoration:none" href="/ui/image?type=iso">ISO Images</a><br>\n'
+            r += '    <br>\n'
+            r += '    <a style="text-decoration:none" href="/ui/user">Settings</a><br>\n'
+            r += '    <br>\n'
+            r += '   <td align="left" valign="top">\n'
+        return r
+
+    def _html_foot(self, user=None):
+        r = ''
+        if user:
+            r += ' </table>\n'
+        r += ' </body>\n'
+        r += '</html>\n'
+        return r
+
+    def _user_select(self):
+        r = ''
+        r += '<select name="user">'
+        r += '<option value=""></option>'
+        for oid, user in user_db.items():
+            r += "<option value=\"%d\">%s (%s)</option>" % (oid, user.name(), user.fullname())
+        r += '</select>'
+        return r
+
+    def _iso_image_select(self):
+        r = ''
+        r += '<select name="iso_image">'
+        r += '<option value=""></option>'
+        for oid, img in image_db.items():
+            if img.type() != Image.TYPE_ISO:
+                continue
+            r += "<option value=\"%d\">%s</option>" % (oid, img.name())
+        r += '</select>'
+        return r
+
+    def _disk_image_select(self, img_id=None):
+        r = ''
+        r += '<select name="disk_image">'
+        r += '<option value=""></option>'
+        for oid, img in image_db.items():
+            if img.type() != Image.TYPE_DISK:
+                continue
+            if img.oid() == img_id:
+                r += "<option value=\"%d\" selected=\"true\">%s</option>" % (oid, img.name())
+            else:
+                r += "<option value=\"%d\">%s</option>" % (oid, img.name())
+        r += '</select>'
+        return r
+
+    def logo_image(self):
+        buf = b''
+        try:
+            f = open('/etc/vmm/logo.jpg', 'rb') # XXX: usr/lib/vmm or usr/share or ...
+            buf = f.read()
+            f.close()
+        except BaseException as e:
+            print("Failed to open image: %s" % (e))
+            pass
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Length', len(buf))
+        self.end_headers()
+        self.wfile.write(buf)
+
+    def ui_login(self, user, args):
+        msg = None
+        if 'username' in args and 'password' in args:
+            username = args['username'][0]
+            user = user_db.get_by_name(username)
+            if user:
+                password = args['password'][0]
+                if user.auth_password(password):
+                    session = user.create_session()
+                    cookie = "session=%s; path=/ui" % session
+                    self._send_response(302, {'Set-Cookie': cookie, 'Location': '/ui'}, None)
+                    return
+            msg = 'Login failed'
+
+        r = self._html_head()
+        r += '  <div align="center">\n'
+        r += '   <form method="POST" action="/ui/login">\n'
+        r += '    <table align="center">\n'
+        r += '     <tr><td>&nbsp;</tr>\n'
+        r += '     <tr><td style="font-size:150%"><b>Login</b></tr>\n'
+        r += '     <tr><td>&nbsp;</tr>\n'
+        r += '     <tr><td><b>Username</b></tr>\n'
+        r += '     <tr><td><input type="text" name="username"/></tr>\n'
+        r += '     <tr><td><b>Password</b></br>\n'
+        r += '     <tr><td><input type="password" name="password"/></tr>\n'
+        r += '     <tr><td align="center"><input type="submit" value="Login"/></tr>\n'
+        r += '    </table>\n'
+        r += '   </form>\n'
+        if msg:
+            r += "   <h2>%s</h2>\n" % (msg)
+        r += '  </div>\n'
+        r += self._html_foot()
+        self._send_response(200, None, r)
+
+    def ui_logout(self, user, args):
+        user.remove_session()
+        cookie = 'session=none; path=/ui'
+        self._send_response(302, {'Set-Cookie': cookie, 'Location': '/ui/login'}, None)
+
+    def ui_overview(self, user, args):
+        total = { 'cpus': 0, 'mem': 0, 'disk': 0 }
+        active = { 'cpus': 0, 'mem': 0, 'disk': 0 }
+        for oid, vm in vm_db.items():
+            if vm.owner().name() != user.name() and not user.in_group('admin'):
+                continue
+            total['cpus'] += vm.cpus()
+            total['mem'] += vm.mem()
+            total['disk'] += vm.disk_size()
+            if vm.running():
+                active['cpus'] += vm.cpus()
+                active['mem'] += vm.mem()
+                active['disk'] += vm.disk_size()
+        r = self._html_head(user)
+        r += '  <p style="font-size:150%">Overview</p>\n'
+        r += '  <table width="100%">\n'
+        r += '   <tr><td>&nbsp;<td style="font-weight:bold">Active<td style="font-weight:bold">Total\n'
+        r += "   <tr><td style=\"font-weight:bold\">CPUs<td>%d<td>%d\n" % (active['cpus'], total['cpus'])
+        r += "   <tr><td style=\"font-weight:bold\">Memory<td>%s<td>%s\n" % (readable_size(active['mem'], ONE_MB), readable_size(total['mem'], ONE_MB))
+        r += "   <tr><td style=\"font-weight:bold\">Disk<td>%s<td>%s\n" % (readable_size(active['disk'], ONE_MB), readable_size(total['disk'], ONE_MB))
+        r += '  </table>\n'
+        r += self._html_foot(user)
+        self._send_response(200, None, r)
+
+    def ui_image(self, user, args):
+        # XXX: auth
+        r = self._html_head(user)
+        # XXX: handle delete better, like user does
+        if 'id' in args:
+            err = None
+            msg = None
+            img_id = int(args['id'][0])
+            img = image_db.get_by_oid(img_id)
+            type_name = img.type_name()
+            edit_mode = ('action' in args) and (args['action'][0] == 'Edit')
+            if 'action' in args:
+                if args['action'][0] == 'Save':
+                    if 'name' in args:
+                        img.name(args['name'][0])
+                    img.public('public' in args)
+                    image_db.save()
+                    msg = 'Settings saved'
+                if args['action'][0] == 'Delete':
+                    image_db.remove(img)
+                    self._send_response(302, {'Location': '/ui/image'}, None)
+                    return
+            r += "  <p style=\"font-size:150%%\">%s</p>\n" % (img.name())
+            if msg:
+                r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
+            if err:
+                r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (errmsg)
+            r += '  <form method="POST" action="/ui/image">\n'
+            r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (type_name)
+            r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (img_id)
+            r += '   <table>\n'
+            if edit_mode:
+                r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (img.name())
+                val = 'checked' if img.public() else ''
+                r += "    <tr><td style=\"font-weight:bold\">Visibility<td><input type=\"checkbox\" name=\"public\" %s>Public\n" % (val)
+                r += '    <tr><td><input type="submit" name="action" value="Save"><td>&nbsp;\n'
+            else:
+                val = 'Public' if img.public() else 'Private'
+                r += "    <tr><td style=\"font-weight:bold\">Visibility<td>%s\n" % (val)
+                r += '    <tr><td><input type="submit" name="action" value="Edit"><td>&nbsp;\n'
+            r += "    <tr><td style=\"font-weight:bold\">Size<td>%s\n" % (readable_size(img.size(), ONE_MB))
+            r += '    <tr><td>&nbsp;<td>&nbsp;\n'
+            r += '    <tr><td><input style="color:red" type="submit" name="action" value="Delete"><td>&nbsp;'
+            r += '   </table>\n'
+            r += '  </form>\n'
+        else:
+            type_name = args['type'][0] if 'type' in args else 'Unknown'
+            r += "  <p style=\"font-size:150%%\">%s Images</p>\n" % (type_name)
+            r += '  <form method="GET" action="/ui/image/create">\n'
+            r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (type_name)
+            r += '   <table width="100%">\n'
+            r += '    <tr>\n'
+            r += '     <td><input type="submit" value="Create">\n'
+            r += '   </table>\n'
+            r += '  </form>\n'
+            r += '  <table width="100%">\n'
+            r += '   <tr style="font-weight:bold"><td>Name<td>Owner<td>Visibility<td>&nbsp;</tr>\n'
+            idx = -1
+            for oid, img in image_db.items():
+                bgcolor = '#e0e0e0' if (idx % 2) == 0 else 'initial'
+                if img.type_name() != type_name:
+                    continue
+                if img.owner().name() != user.name() and not img.public() and not user.in_group('admin'):
+                    continue
+                idx += 1
+                r += "   <tr style=\"background-color:%s\">" % (bgcolor)
+                r += "<td><a href=\"/ui/image?id=%d\">%s</a>" % (img.oid(), img.name())
+                r += "<td>%s" % (img.owner().name())
+                r += "<td>%s" % ('Public' if  img.public() else 'Private')
+                if not img.copying():
+                    if img.type() == Image.TYPE_DISK:
+                        r += "<td><a href=\"/ui/vm/create?img_id=%d\">Launch</a>" % (img.oid())
+                    else:
+                        r += "<td>&nbsp;"
+                else:
+                    r += "<td>Creating..."
+                r += '</tr>\n'
+            r += '  </table>\n'
+        r += self._html_foot(user)
+        self._send_response(200, None, r)
+
+    def ui_image_create(self, user, args):
+        r = self._html_head(user)
+        msg = None
+        err = None
+        if 'action' in args and args['action'][0] == 'Create':
+            img = None
+            name = args['name'][0]
+            public = args['public'][0] if 'public' in args else False
+            if args['image_source'][0] == 'upload_file':
+                filename = args['upload_file.filename'][0]
+                data = args['upload_file'][0]
+                img = Image.create_from_upload(name, filename, data, user, public)
+            if args['image_source'][0] == 'server_file':
+                pathname = args['server_file'][0]
+                if user.may_access_file(pathname):
+                    img = Image.create_from_local(name, pathname, user, public)
+                else:
+                    err = 'Permission denied'
+            if args['image_source'][0] == 'remote_url':
+                url = args['remote_url'][0]
+                img = Image.create_from_url(name, url, user, public)
+            if img:
+                image_db.insert(img)
+                self._send_response(302, {'Location': "/ui/image?id=%d" % (img.oid())}, None)
+
+        r += '  <p style="font-size:150%">Create Image</p>\n'
+        if msg:
+            r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
+        if err:
+            r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (err)
+        r += '  <script>\n'
+        r += '   function imageSourceSelected(sel) {\n'
+        r += '    var vec = [\n'
+        r += '     document.getElementById("image_upload_row"),\n'
+        r += '     document.getElementById("image_local_row"),\n'
+        r += '     document.getElementById("image_remote_row")\n'
+        r += '    ];\n'
+        r += '    for (i = 0; i < 3; i++) {\n'
+        r += '     if (sel.selectedIndex == i) {\n'
+        r += '      vec[i].style.display = "table-row";\n'
+        r += '     }\n'
+        r += '     else {\n'
+        r += '      vec[i].style.display = "none";\n'
+        r += '     }\n'
+        r += '    }\n'
+        r += '   }\n'
+        r += '  </script>\n'
+        r += '  <form method="POST" action="/ui/image/create" enctype="multipart/form-data">\n'
+        r += '   <table>\n'
+        r += '    <tr><td style="font-weight:bold">Name<td><input type="text" name="name">\n'
+        r += '    <tr><td style="font-weight:bold">Image Source<td><select name="image_source" onChange="imageSourceSelected(this);">'
+        r += '<option value="upload_file">Upload File</option>'
+        r += '<option value="server_file">Server File</option>'
+        r += '<option value="remote_url">Remote URL</option>'
+        r += '</select>\n'
+        r += '    <tr style="display:table-row" id="image_upload_row"><td style="font-weight:bold">Upload File<td><input type="file" name="upload_file">\n'
+        r += '    <tr style="display:none" id="image_local_row"><td style="font-weight:bold">Server File<td><input type="text" name="server_file" size="32">\n'
+        r += '    <tr style="display:none" id="image_remote_row"><td style="font-weight:bold">Remote URL<td><input type="text" name="remote_url" size="32">\n'
+        r += '    <tr><td><input type="checkbox" name="public">Public<td>&nbsp;\n'
+        r += '    <tr><td colspan="2" align="center"><input type="submit" name="action" value="Create">\n'
+        r += '   </table>\n'
+        r += '  </form>\n'
+        r += self._html_foot(user)
+        self._send_response(200, None, r)
+
+    def ui_user(self, user, args):
+        is_admin = user.in_group('admin')
+        args_id = None
+        r = self._html_head(user)
+        if 'id' in args:
+            args_id = int(args['id'][0])
+            if args_id != user.oid() and not is_admin:
+                r += '  <p>Access denied</p>\n'
+                r += self._html_foot(user)
+                self._send_response(403, None, r)
+                return
+            user = user_db.get_by_oid(args_id)
+        msg = None
+        err = None
+        token = None
+        if 'action' in args:
+            changed = False
+            if args['action'][0] == 'Save':
+                if (not is_admin) and ('localuid' in args):
+                    r += '  <p>Access denied</p>\n'
+                    r += self._html_foot(user)
+                    self._send_response(403, None, r)
+                    return
+                if 'fullname' in args:
+                    user.fullname(args['fullname'][0])
+                    changed = True
+                if 'oldpass' in args and 'newpass1' in args and 'newpass2' in args:
+                    if not err and not user.auth_password(args['oldpass'][0]):
+                        err = 'Old password is incorrect'
+                    if not err and args['newpass1'][0] != args['newpass2'][0]:
+                        err = 'New passwords do not match'
+                    if not err:
+                        user.password(args['newpass1'][0])
+                        changed = True
+                if 'email' in args:
+                    user.email(args['email'][0])
+                    changed = True
+                if 'timezone' in args:
+                    user.timezone(args['timezone'][0])
+                    changed = True
+                if 'localuid' in args:
+                    user.localuid(int(args['localuid'][0]))
+                    changed = True
+            if args['action'][0] == 'Delete':
+                if not is_admin:
+                    r += '  <p>Access denied</p>\n'
+                    r += self._html_foot(user)
+                    self._send_response(403, None, r)
+                    return
+                user_db.remove(user)
+                msg = 'User deleted'
+                args_id = None
+            if args['action'][0] == 'Generate':
+                token = sha256_string("%s%s%s" % (user.name(), user.pwhash(), time.time()))
+                user.token(token)
+                changed = True
+            if changed:
+                user_db.save()
+                msg = 'Settings saved'
+        r += '  <p style="font-size:150%">Settings</p>\n'
+        if msg:
+            r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
+        if err:
+            r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (err)
+        if is_admin and not args_id:
+            r += '  <p style="font-size:125%">Users</p>\n'
+            r += '  <form method="GET" action="/ui/user/create">\n'
+            r += '   <table width="100%">\n'
+            r += '    <tr>\n'
+            r += '     <td><input type="submit" value="Create">\n'
+            r += '   </table>\n'
+            r += '  </form>\n'
+            r += '  <table width="100%">\n'
+            r += '   <tr><td>Name<td>Full name<td>&nbsp;\n'
+            for oid, obj in user_db.items():
+                r += "   <tr><td><a href=\"/ui/user?id=%d\">%s</a><td>%s" % (oid, obj.name(), obj.fullname())
+                r += '<td><form method="POST" action="/ui/user">'
+                r += "<input type=\"hidden\" name=\"id\" value=\"%d\">" % (oid)
+                r += '<input type="submit" name="action" value="Delete">\n'
+                r += '</form>\n'
+            r += '  </table>\n'
+        else:
+            r += '  <form method="POST" action="/ui/user">\n'
+            r += "   <input type=\"hidden\" name=\"id\" value=%d>\n" % (user.oid())
+            r += '   <table width="100%">\n'
+            r += '    <tr><td style="font-size:80%;font-weight:bold">Full name<td>&nbsp;\n'
+            r += "    <tr><td><input type=\"text\" name=\"fullname\" value=\"%s\"><td>&nbsp;\n" % (user.fullname())
+            r += '    <tr><td colspan="2">&nbsp;\n'
+            r += '    <tr><td style="font-size:80%;font-weight:bold">Password<td>&nbsp\n'
+            r += '    <tr><td><input type="password" name="oldpass">&nbsp;[old]<td>&nbsp;\n'
+            r += '    <tr><td><input type="password" name="newpass1">&nbsp;[new]<td>&nbsp;\n'
+            r += '    <tr><td><input type="password" name="newpass2">&nbsp;[confirm]<td>&nbsp;\n'
+            r += '    <tr><td colspan="2">&nbsp;\n'
+            r += '    <tr><td style="font-size:80%;font-weight:bold">Email<td>&nbsp\n'
+            r += "    <tr><td><input type=\"text\" name=\"email\" value=\"%s\"><td>&nbsp;\n" % (user.email())
+            if is_admin:
+                r += '    <tr><td style="font-size:80%;font-weight:bold">Local UID<td>&nbsp\n'
+                r += "    <tr><td><input type=\"number\" name=\"localuid\" value=\"%s\"<td>&nbsp;\n" % (user.localuid())
+            r += '    <tr><td colspan="2">&nbsp;\n'
+#            r += '    <tr><td style="font-size:80%;font-weight:bold">Time zone<td>&nbsp;\n'
+#            r += "    <tr><td><input type=\"text\" name=\"timezone\" value=\"%s\"><td>&nbsp;\n" % (user.timezone())
+            r += '    <tr><td><input type="submit" name="action" value="Save"><td>&nbsp;\n'
+            r += '    <tr><td colspan="2">&nbsp;\n'
+            r += "    <tr><td>API token: %s<td>&nbsp;\n" % (token if token else "[hidden]")
+            r += '    <tr><td><input type="submit" name="action" value="Generate"><td>&nbsp;\n'
+            r += '   </table>\n'
+            r += '  </form>\n'
+        r += self._html_foot(user)
+        self._send_response(200, None, r)
+
+    def ui_user_create(self, user, args):
+        r = self._html_head(user)
+        if not user.in_group('admin'):
+            r += '  Access denied'
+            r += self._html_foot(user)
+            self._send_response(403, None, r)
+            return
+        msg = None
+        err = None
+        if 'action' in args and args['action'][0] == 'Add':
+            name = args['name'][0]
+            fullname = args['fullname'][0]
+            password = args['password'][0]
+            user = User.create(name, fullname, password, [])
+            user_db.insert(user)
+            msg = 'User created'
+
+        r += '  <p style="font-size:150%">Add user</p>\n'
+        if msg:
+            r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
+        if err:
+            r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (err)
+        r += '  <form method="POST" action="/ui/user/create">\n'
+        r += '   <p style="font-size:80%;font-weight:bold">User name</p>\n'
+        r += '   <input type="text" name="name"><br>\n'
+        r += '   <p style="font-size:80%;font-weight:bold">Full name</p>\n'
+        r += '   <input type="text" name="fullname"><br>\n'
+        r += '   <p style="font-size:80%;font-weight:bold">Password</p>\n'
+        r += '   <input type="password" name="password"><br>\n'
+        r += '   <br>\n'
+        r += '   <input type="submit" name="action" value="Add"><br>\n'
+        r += '  </form>\n'
+        r += self._html_foot(user)
+        self._send_response(200, None, r)
+
+    # list, delete, start/reset/poweroff/kill on main page
+    # start/reset/poweroff/kill, insert/eject on detail page
+    def ui_vm(self, user, args):
+        # XXX: auth
+        r = self._html_head(user)
+        if 'id' in args:
+            err = None
+            msg = None
+            server_host = self.headers['Host']
+            if ':' in server_host:
+                server_host = server_host.split(':')[0]
+            vm_id = int(args['id'][0])
+            vm = vm_db.get_by_oid(vm_id)
+            edit_mode = (not vm.running()) and ('action' in args) and (args['action'][0] == 'Edit')
+            if 'action' in args:
+                if args['action'][0] == 'Save':
+                    if 'name' in args:
+                        vm.name(args['name'][0])
+                    if 'cpus' in args:
+                        vm.cpus(int(args['cpus'][0]))
+                    if 'mem' in args:
+                        mem = parse_num(args['mem'][0])
+                        if mem >= ONE_MB:
+                            mem /= ONE_MB
+                        vm.mem(mem)
+                    vm_db.save()
+                    msg = 'Settings saved'
+                if args['action'][0] == 'Start':
+                    ro = 'readonly' in args
+                    vm.start(readonly=ro)
+                if args['action'][0] == 'Suspend':
+                    vm.suspend()
+                if args['action'][0] == 'Power Off':
+                    vm.poweroff()
+                if args['action'][0] == 'Kill':
+                    vm.kill()
+                    time.sleep(1)
+                if args['action'][0] == 'Insert':
+                    oid = int(args['iso_image'][0])
+                    img = image_db.get_by_oid(oid)
+                    vm.iso_insert(img.pathname())
+                if args['action'][0] == 'Eject':
+                    vm.iso_eject()
+                if args['action'][0] == 'Delete':
+                    if not vm.running():
+                        file_delete(vm.disk_pathname())
+                        vm_db.remove(vm)
+                        self._send_response(302, {'Location': '/ui/vm'}, None)
+                    else:
+                        err = 'Cannot delete: machine is running'
+                if args['action'][0] == 'Create Image':
+                    name = args['image_name'][0]
+                    public = args['image_public'][0]
+                    img = Image.create_from_vmdisk(name, vm, user, public)
+                    image_db.insert(img)
+            r += "  <p style=\"font-size:150%%\">%s</p>\n" % (vm.name())
+            if msg:
+                r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
+            if err:
+                r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (errmsg)
+            r += '  <form method="POST" action="/ui/vm">\n'
+            r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (vm_id)
+            r += '   <table>\n'
+            #XXX r += "    <tr><td style=\"font-weight:bold\">Arch<td>%s\n" % (vm.arch())
+            if edit_mode:
+                r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (vm.name())
+                r += "    <tr><td style=\"font-weight:bold\">CPUs<td><input type=\"number\" name=\"cpus\" value=\"%d\" size=\"6\">\n" % (vm.cpus())
+                r += "    <tr><td style=\"font-weight:bold\">Mem<td><input type=\"text\" name=\"mem\" value=\"%s\" size=\"6\">\n" % (readable_size(vm.mem(), ONE_MB))
+                r += '    <tr><td><input type="submit" name="action" value="Save"><td>&nbsp;\n'
+            else:
+                r += "    <tr><td style=\"font-weight:bold\">CPUs<td>%d\n" % (vm.cpus())
+                r += "    <tr><td style=\"font-weight:bold\">Mem<td>%s\n" % (readable_size(vm.mem(), ONE_MB))
+                if not vm.running():
+                    r += '    <tr><td><input type="submit" name="action" value="Edit"><td>&nbsp;\n'
+            r += "    <tr><td style=\"font-weight:bold\">Disk<td>%s\n" % (readable_size(vm.disk_size(), ONE_MB))
+            r += "    <tr><td style=\"font-weight:bold\">State<td>%s\n" % (vm.state())
+            r += "    <tr><td style=\"font-weight:bold\">MAC<td>%s\n" % (vm.macaddr())
+            r += "    <tr><td style=\"font-weight:bold\">Addr<td>%s\n" % (vm.ipv4addr())
+            r += '    <tr><td>&nbsp;<td>&nbsp;\n'
+            if vm.running():
+                r += "    <tr><td style=\"font-weight:bold\">VNC<td>%s:%d\n" % (server_host, vm_id)
+                r += "    <tr><td style=\"font-weight:bold\">Serial<td>%s:%d\n" % (server_host, vm_id + 9000)
+                r += '    <tr><td>&nbsp;<td>&nbsp;\n'
+            r += '   </table>\n'
+            r += '   <table>\n'
+            r += '    <tr><td style="font-weight:bold">ISO'
+            if vm.iso_pathname():
+                name = vm.iso_pathname()
+                for oid, iso in image_db.items():
+                    if iso.pathname() == vm.iso_pathname():
+                        name = iso.name()
+                        break
+                r += "<td>%s<input style=\"float:right\" type=\"submit\" name=\"action\" value=\"Eject\">\n" % (name)
+            else:
+                r += "<td>%s<input type=\"submit\" name=\"action\" value=\"Insert\">\n" % (self._iso_image_select())
+            r += '    <tr><td>&nbsp;<td>&nbsp;\n'
+            if vm.running():
+                r += '    <tr><td colspan="2"><input type="submit" name="action" value="Suspend">\n'
+                r += '    <tr><td colspan="2"><input type="submit" name="action" value="Power Off">\n'
+                r += '    <tr><td colspan="2"><input type="submit" name="action" value="Kill">\n'
+            elif vm.copying():
+                r += "    <tr><td style=\"font-weight:bold\">Copying<td>%d%%\n" % (vm.copy_pct())
+            else:
+                r += '    <tr><td colspan="2"><input type="submit" name="action" value="Start">'
+                if vm.disk_pathname().endswith('.vmdk'):
+                    r += '<input type="checkbox" name="readonly" disabled checked>Read only mode\n'
+                else:
+                    r += '<input type="checkbox" name="readonly">Read only mode\n'
+                r += '    <tr><td colspan="2"><input style="color:red" type="submit" name="action" value="Delete">\n'
+                r += '    <tr><td colspan="2"><hr>\n'
+                r += '    <tr><td style="font-size:125%">Create image from disk<td>&nbsp;\n'
+                r += '    <tr><td style="font-weight:bold">Name<td><input type="text" name="image_name">\n'
+                r += '    <tr><td>&nbsp;<td><input type="checkbox" name="image_public">Public\n'
+                r += '    <tr><td colspan="2"><input type="submit" name="action" value="Create Image">\n'
+            r += '\n'
+            r += '   </table>\n'
+            r += '  </form>\n'
+        else:
+            r += '  <p style="font-size:150%">Virtual Machines</p>\n'
+            r += '  <form method="GET" action="/ui/vm/create">\n'
+            r += '   <table width="100%">\n'
+            r += '    <tr>\n'
+            r += '     <td><input type="submit" value="Create">\n'
+            r += '   </table>\n'
+            r += '  </form>\n'
+            r += '  <table with="100%">\n'
+            r += '   <tr style="font-weight:bold"><td>Name<td>State<td>Address</tr>\n'
+            idx = -1
+            for oid, vm in vm_db.items():
+                idx += 1
+                bgcolor = '#e0e0e0' if (idx % 2) == 0 else 'initial'
+                if vm.owner().name() != user.name() and not user.in_group('admin'):
+                    continue
+                addr = '&nbsp;'
+                if vm.running():
+                    addr = vm.ipv4addr()
+                r += "   <tr style=\"background-color:%s\">" % (bgcolor)
+                r += "<td><a href=\"/ui/vm?id=%d\">%s</a>" % (vm.oid(), vm.name())
+                r += "<td>%s" % (vm.state())
+                r += "<td>%s" % (addr)
+                # XXX: create-time (age), on-time (uptime)
+                r += '</tr>\n'
+            r += '  </table>\n'
+        r += self._html_foot(user)
+        self._send_response(200, None, r)
+
+    def ui_vm_create(self, user, args):
+        r = self._html_head(user)
+        msg = None
+        err = None
+        if 'action' in args and args['action'][0] == 'Create':
+            vm = None
+            name = args['name'][0]
+            arch = args['arch'][0]
+            if arch != 'x86_64':
+                err = 'Invalid arch'
+            cpus = int(args['cpus'][0])
+            if cpus < 1 or cpus > 8:
+                err = 'Invalid CPUs'
+            mem = parse_num(args['mem'][0])
+            if mem >= ONE_MB:
+                mem /= ONE_MB
+            if mem < 1 or mem > 16*1024:
+                err = 'Invalid mem'
+            if args['disk_source'][0] == 'create_new':
+                disk_size = parse_num(args['disk_size'][0])
+                if disk_size >= ONE_MB:
+                    disk_size /= ONE_MB
+                if disk_size < 1 or disk_size > 256*1024:
+                    err = 'Invalid disk size'
+                vm = VirtualMachine.create_new(name, user, arch, cpus, mem, disk_size)
+            if args['disk_source'][0] == 'use_image':
+                image_oid = int(args['disk_image'][0])
+                vm = VirtualMachine.create_from_image(name, user, arch, cpus, mem, image_oid)
+            if args['disk_source'][0] == 'upload_file':
+                filename = args['upload_file.filename'][0]
+                data = args['upload_file'][0]
+                vm = VirtualMachine.create_from_upload(name, user, arch, cpus, mem, filename, data)
+            if args['disk_source'][0] == 'server_file':
+                pathname = args['server_file'][0]
+                if user.may_access_file(pathname):
+                    vm = VirtualMachine.create_from_local(name, user, arch, cpus, mem. pathname)
+                else:
+                    err = 'Permission denied'
+            if args['disk_source'][0] == 'remote_url':
+                image_url = args['remote_url'][0]
+                vm = VirtualMachine.create_from_url(name, user, arch, cpus, mem, image_url)
+            vm_db.insert(vm)
+            self._send_response(302, {'Location': "/ui/vm?id=%d" % (vm.oid())}, None)
+
+        img_id = int(args['img_id'][0]) if 'img_id' in args else None
+        r += '  <p style="font-size:150%">Create VM</p>\n'
+        if msg:
+            r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
+        if err:
+            r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (err)
+        r += '  <script>\n'
+        r += '   function diskSourceSelected(sel) {\n'
+        r += '    var vec = [\n'
+        r += '     document.getElementById("disk_size_row"),\n'
+        r += '     document.getElementById("disk_image_row"),\n'
+        r += '     document.getElementById("disk_upload_row"),\n'
+        r += '     document.getElementById("disk_local_row"),\n'
+        r += '     document.getElementById("disk_remote_row")\n'
+        r += '    ];\n'
+        r += '    for (i = 0; i < 5; i++) {\n'
+        r += '     if (sel.selectedIndex == i) {\n'
+        r += '      vec[i].style.display = "table-row";\n'
+        r += '     }\n'
+        r += '     else {\n'
+        r += '      vec[i].style.display = "none";\n'
+        r += '     }\n'
+        r += '    }\n'
+        r += '   }\n'
+        r += '  </script>\n'
+        r += '  <form method="POST" action="/ui/vm/create">\n'
+        r += '   <table>\n'
+        r += '    <input type="hidden" name="arch" value="x86_64">\n'
+        r += '    <tr><td style="font-weight:bold">Name<td><input type="text" name="name">\n'
+        r += '    <tr><td style="font-weight:bold">CPUs<td><input type="number" name="cpus" size="4">\n'
+        r += '    <tr><td style="font-weight:bold">Memory<td><input type="text" name="mem" size="8">\n'
+        r += '    <tr><td style="font-weight:bold">Disk Source<td><select name="disk_source" onChange="diskSourceSelected(this);">'
+        r += '<option value="create_new">Create New</option>'
+        if img_id:
+            r += '<option value="use_image" selected="true">Use Image</option>'
+        else:
+            r += '<option value="use_image">Use Image</option>'
+        r += '<option value="upload_file">Upload File</option>'
+        r += '<option value="server_file">Server File</option>'
+        r += '<option value="remote_url">Remote URL</option>'
+        r += '</select>\n'
+        if img_id:
+            r += '    <tr style="display:none" id="disk_size_row"><td style="font-weight:bold">Disk Size<td><input type="text" name="disk_size" size="8">\n'
+            r += "    <tr style=\"display:table-row\" id=\"disk_image_row\"><td style=\"font-weight:bold\">Disk Image<td>%s\n" % (self._disk_image_select(img_id))
+        else:
+            r += '    <tr style="display:table-row" id="disk_size_row"><td style="font-weight:bold">Disk Size<td><input type="text" name="disk_size" size="8">\n'
+            r += "    <tr style=\"display:none\" id=\"disk_image_row\"><td style=\"font-weight:bold\">Disk Image<td>%s\n" % (self._disk_image_select(img_id))
+        r += '    <tr style="display:none" id="disk_upload_row"><td style="font-weight:bold">Upload File<td><input type="file" name="upload_file">\n'
+        r += '    <tr style="display:none" id="disk_local_row"><td style="font-weight:bold">Server File<td><input type="text" name="server_file" size="32">\n'
+        r += '    <tr style="display:none" id="disk_remote_row"><td style="font-weight:bold">Remote URL<td><input type="text" name="remote_url" size="32">\n'
+        r += '    <tr><td colspan="2" align="center"><input type="submit" name="action" value="Create">\n'
+        r += '   </table>\n'
+        r += '  </form>\n'
+        r += self._html_foot(user)
+        self._send_response(200, None, r)
+
+    def _handle_request(self):
+        try:
+            path = self.path
+            args = {}
+            if self.command == 'GET':
+                if '?' in self.path:
+                    (path, query_string) = self.path.split('?', 1)
+                    args = urllib.parse.parse_qs(query_string)
+            if self.command == 'POST':
+                content_type = self.headers['Content-Type']
+                content_len = int(self.headers['Content-Length'])
+                content = self.rfile.read(content_len)
+                if content_type == 'application/x-www-form-urlencoded':
+                    args = urllib.parse.parse_qs(content.decode())
+                if content_type == 'application/json':
+                    args = json.loads(content.decode())
+                if content_type.startswith('multipart/form-data'):
+                    hdr_str = "Mime-Version: 1.0\r\nContent-Type: %s\r\n\r\n" % (content_type)
+                    parser = email.parser.BytesParser(policy=email.policy.default)
+                    msg = parser.parsebytes(hdr_str.encode() + content)
+                    args = {}
+                    for part in msg.walk():
+                        disp = part.get('Content-Disposition', '')
+                        if not disp.startswith('form-data'):
+                            continue
+                        formdata = {}
+                        for field in disp.split(';'):
+                            if not '=' in field:
+                                continue
+                            (k,v) = field.strip().split('=', 1)
+                            v = v.strip('"')
+                            formdata[k] = v
+                        input_name = formdata['name']
+                        if not input_name in args:
+                            args[input_name] = []
+                        args[input_name].append(part.get_content())
+                        if 'filename' in formdata:
+                            args["%s.filename" % (input_name)] = [formdata['filename']]
+
+            user = None
+            if 'Authorization' in self.headers:
+                fields = self.headers['Authorization'].split()
+                if len(fields) == 2 and fields[0] == 'Bearer':
+                    token = fields[1]
+                    for oid, obj in user_db.items():
+                        if obj.token() == token:
+                            user = obj
+                            break
+            if 'Cookie' in self.headers:
+                for kvp in self.headers['Cookie'].split(';'):
+                    (k, v) = kvp.strip().split('=', 1)
+                    if k == 'session':
+                        user = User.get_from_session(v)
+            if not user and path != '/ui/login':
+                self._send_response(302, {'Location': '/ui/login'}, None)
+                return
+            if not path in self._dispatch_table:
+                r = self._html_head(user)
+                r += '  Page not found\n'
+                r += self._html_foot(user)
+                self._send_response(404, None, r)
+                return
+            self._dispatch_table[path](user, args)
+        except BaseException as e:
+            # XXX: send json for api requests
+            r = self._html_head()
+            r += '  <p>Exception handling request</p>\n'
+            r += "  <pre>%s</pre>\n" % (e)
+            if log_debug: # XXX: opts['debug']
+                r += '  <p>Backtrace</p>\n'
+                r += '  <pre>\n'
+                for line in traceback.format_tb(e.__traceback__):
+                    r += "%s\n" % (line)
+                r += '  </pre>\n'
+            r += self._html_foot()
+            self._send_response(500, None, r)
+
+    def do_GET(self):
+        if self.path == '/ui/vmm.jpg':
+            self.logo_image()
+            return
+        self._handle_request()
+
+    def do_POST(self):
+        self._handle_request()
+
+def raw_http_listener():
+    listen_addr = (config['http.listen.address'], config['http.listen.port'])
+    if sys.hexversion >= 0x030700f0:
+        server = http.server.ThreadingHTTPServer(listen_addr, HttpClientRequestHandler)
+    else:
+        logw("HTTP server threading disabled because Python version is less than 3.7")
+        server = http.server.HTTPServer(listen_addr, HttpClientRequestHandler)
+    server.cookies = dict()
+    server.serve_forever()
+
+def ssl_http_listener():
+    listen_addr = (config['http.listen.ssladdress'], config['http.listen.sslport'])
+    if sys.hexversion >= 0x030700f0:
+        server = http.server.ThreadingHTTPServer(listen_addr, HttpClientRequestHandler)
+    else:
+        logw("HTTPS server threading disabled because Python version is less than 3.7")
+        server = http.server.HTTPServer(listen_addr, HttpClientRequestHandler)
+    server.cookies = dict()
+    server.socket = ssl.wrap_socket(server.socket, certfile=config['ssl.certfile'], server_side=True)
+    server.serve_forever()
+
+### File copier ###
+
+file_copy_lock = threading.Lock()
+file_copy_queue = []
+
+def file_copy_async(src_loc, src_obj, dst_loc, dst_obj):
+    if src_obj:
+        src_obj.copying(True)
+    if dst_obj:
+        dst_obj.copying(True)
+    file_copy_lock.acquire()
+    file_copy_queue.append((src_loc, src_obj, dst_loc, dst_obj))
+    file_copy_lock.release()
+
+def file_copy_simple(srcfile, dstfile, file_size, watcher):
+    off = 0
+    while off < file_size:
+        chunk = min(1024*1024, file_size - off)
+        buf = srcfile.read(chunk)
+        if len(buf) == 0:
+            raise RuntimeError("Failed to read")
+        dstfile.write(buf)
+        off += len(buf)
+        if watcher:
+            watcher.copy_pct((int)(100 * off / file_size))
+
+# XXX: could provide better status with disk blocks and copied size
+def file_copy_sparse(srcfile, dstfile, file_size, watcher):
+    off = 0
+    while off < file_size:
+        off = srcfile.seek(off, os.SEEK_DATA)
+        end = srcfile.seek(off, os.SEEK_HOLE)
+        srcfile.seek(off)
+        dstfile.seek(off)
+        while off < end:
+            chunk = min(1024*1024, end - off)
+            buf = srcfile.read(chunk)
+            if len(buf) == 0:
+                raise RuntimeError("Failed to read")
+            dstfile.write(buf)
+            off += len(buf)
+            if watcher:
+                watcher.copy_pct((int)(100 * off / file_size))
+
+def file_copier():
+    while True:
+        try:
+            item = None
+            file_copy_lock.acquire()
+            if file_copy_queue:
+                item = file_copy_queue.pop(0)
+            file_copy_lock.release()
+            if item:
+                (src_loc, src_obj, dst_loc, dst_obj) = item
+                if src_loc.startswith('/'):
+                    srcfile = open(src_loc, 'rb')
+                    dstfile = open(dst_loc, 'wb')
+                    size = os.stat(src_loc).st_size
+                    file_copy_sparse(srcfile, dstfile, size, dst_obj)
+                else:
+                    srcfile = urllib.request.urlopen(src_loc)
+                    dstfile = open(dst_loc, 'wb')
+                    size = int(srcfile.headers.get('Content-Length', '0'))
+                    file_copy_simple(srcfile, dstfile, size, dst_obj)
+                if dst_obj:
+                    dst_obj.copying(False)
+                if src_obj:
+                    src_obj.copying(False)
+        except BaseException as e:
+            loge("Exception in file_copy thread: %s" % (e))
+        time.sleep(1)
+
+### Virtual machine reaper ###
+
+def vm_reaper():
+    while True:
+        try:
+            for oid, vm in vm_db.items():
+                if vm.running():
+                    proc_dir = "/proc/%d" % (vm.pid())
+                    if not os.path.isdir(proc_dir):
+                        vm.notify_stopped()
+        except BaseException as e:
+            loge("Exception in vm_reaper thread: %s" % (e))
+        time.sleep(1)
+
+### Lease updater ###
+
+def lease_updater():
+    leases_pathname = "%s/dnsmasq.leases" % (state_dir)
+    last_mtime = 0
+    while True:
+        try:
+            cur_mtime = os.stat(leases_pathname)
+            if cur_mtime != last_mtime:
+                last_mtime = cur_mtime
+                f = open(leases_pathname, 'r')
+                for line in f:
+                    fields = line.split()
+                    vm_mac = fields[1]
+                    vm_ip = fields[2]
+                    vm_name = fields[3]
+                    # XXX: Create VM dict indexed by MAC addr
+                    for oid, vm in vm_db.items():
+                        if vm.macaddr() == vm_mac:
+                            if vm.ipv4addr() != vm_ip:
+                                vm.ipv4addr(vm_ip)
+                f.close()
+        except OSError as e:
+            last_mtime = 0
+        except BaseException as e:
+            loge("Exception in lease_updater thread: %s" % (e))
+        time.sleep(1)
+
+### Main ###
+
+config_defaults = {
+    'http.listen.address': '127.0.0.1',
+    'http.listen.port': 8080,
+
+    'iso.storage.location': '/var/lib/vmm/isos',
+    'image.storage.location': '/var/lib/vmm/images',
+
+    'disk.storage.type': 'dir',
+    'disk.storage.location': '/var/lib/vmm/disk',
+    'disk.storage.name': '%u.%n',
+
+    'network.mode': 'manual',
+    'network.bridge.name': 'br0',
+    'network.bridge.mode': 'subnet',
+    'network.bridge.addr': '172.16.1.1/24',
+    'network.dhcp.start': '172.16.1.2',
+    'network.dhcp.end': '172.16.1.254',
+    'network.proxy_arp_dev': 'eth0',
+
+    'vm.nesting': True,
+
+    'vm.max_cpu': '',
+    'vm.max_mem': '',
+    'vm.max_disk': '',
+
+    'user.max_cpu': '',
+    'user.max_mem': '',
+    'user.max_disk': ''
+}
+
+config = Config('/etc/vmm/config', config_defaults)
+
+global_opts = 'dv'
+global_longopts = ['debug', 'verbose']
+optargs, argv = getopt.getopt(sys.argv[1:], global_opts, global_longopts)
+for k,v in optargs:
+    if k in ('-d', '--debug'):
+        log_debug = True
+    if k in ('-v', '--verbose'):
+        log_verbose += 1
+
+mkdir_p(state_dir)
+mkdir_p(run_dir)
+
+mkdir_p(config['iso.storage.location'])
+mkdir_p(config['image.storage.location'])
+mkdir_p(config['disk.storage.location'])
+
+# Initialize databases
+user_db = NamedObjectDatabase(User, "%s/user.db" % (state_dir))
+if user_db.empty():
+    root = User.create('root', 'Root User', 'root', ['admin'])
+    user_db.insert(root)
+else:
+    root = user_db.get_by_name('root')
+image_db = NamedObjectDatabase(Image, "%s/image.db" % (state_dir))
+if image_db.empty():
+    for filename in os.listdir(config['iso.storage.location']):
+        pathname = "%s/%s" % (config['iso.storage.location'], filename)
+        (name, ext) = os.path.splitext(filename)
+        if not ext in ['.iso']:
+            continue
+        img = Image(None, name, pathname, root, True)
+        image_db.insert(img)
+    for filename in os.listdir(config['image.storage.location']):
+        pathname = "%s/%s" % (config['image.storage.location'], filename)
+        (name, ext) = os.path.splitext(filename)
+        if not ext in ['.vmdk', '.qcow2']:
+            continue
+        img = Image(None, name, pathname, root, True)
+        image_db.insert(img)
+vm_db = NamedObjectDatabase(VirtualMachine, "%s/vm.db" % (state_dir))
+if vm_db.empty():
+    # XXX: handle LVM
+    for filename in os.listdir(config['disk.storage.location']):
+        pathname = "%s/%s" % (config['disk.storage.location'], filename)
+        fields = filename.split('.') # XXX: parse better: username.vmname.ext
+        if len(fields) != 3:
+            continue
+        if not fields[2] in ['qcow2', 'vmdk']:
+            continue
+        vm = VirtualMachine(None, fields[0], fields[1], platform.machine(), '2', '4096', pathname)
+        vm_db.insert(vm)
+
+if False: # XXX: We cannot import disks, they must be associated with VMs
+    if config['disk.storage.type'] == 'dir':
+        mkdir_p(config['disk.storage.location'])
+        for filename in os.listdir(config['disk.storage.location']):
+            # XXX: vmdk also
+            if not filename.endswith('.qcow2'):
+                continue
+            name = filename[:-6]
+            pathname = "%s/%s" % (config['disk.storage.location'], filename)
+            disk = Disk(None, name, pathname, root, True)
+            disk_db.insert(disk)
+    if config['disk.storage.type'] == 'lvm':
+        vg_path = "/dev/%s" % (config['disk.storage.location'])
+        for name in os.listdir(vg_path):
+            pathname = "%s/%s" % (vg_path, filename)
+            disk = Disk(None, name, pathname, root)
+            disk_db.insert(img)
+else:
+    removed = []
+    for oid, img in image_db.items():
+        if not os.path.exists(img.pathname()):
+            logi("Image %s at %s disappeared" % (img.name(), img.pathname()))
+            removed.append(img)
+    for img in removed:
+        image_db.remove(img)
+
+# Setup networking
+
+if config['network.mode'] == 'bridge':
+    argv = [find_in_path('brctl'),
+            'addbr', config['network.bridge.name']]
+    try:
+        cmd_run(argv)
+    except:
+        # XXX: handle errors other than already exists
+        pass
+    argv = [find_in_path('ip'),
+            'addr', 'add', config['network.bridge.addr'],
+            'dev', config['network.bridge.name']]
+    try:
+        cmd_run(argv)
+    except:
+        # XXX: handle errors other than already exists
+        pass
+    if 'network.proxy_arp_dev' in config:
+        pathname = "/proc/sys/net/ipv4/conf/%s/proxy_arp" % (config['network.proxy_arp_dev'])
+        file_write(pathname, "1")
+
+    dnsmasq_pid = pidfile_read('dnsmasq')
+    if not pid_exists(dnsmasq_pid):
+        logi("Starting dnsmasq...")
+        cfg_filename = "%s/dnsmasq-vmm.conf" % (run_dir)
+        f = open(cfg_filename, 'w')
+        f.write("pid-file=%s/dnsmasq.pid\n" % (run_dir))
+        f.write("interface=%s\n" % (config['network.bridge.name']))
+        f.write("except-interface=lo\n")
+        f.write("no-hosts\n")
+        f.write("no-resolv\n")
+        # DNS
+        f.write("local=%s\n" % (config['network.dns.server']))
+        # DHCP
+        f.write("dhcp-leasefile=%s/dnsmasq.leases\n" % (state_dir))
+        f.write("dhcp-range=%s,%s\n" % (config['network.dhcp.start'], config['network.dhcp.end']))
+        f.write("dhcp-authoritative\n")
+        f.close()
+        args = []
+        args.append(find_in_path('dnsmasq'))
+        args.append("--conf-file=%s" % (cfg_filename))
+        fork_child(args)
+
+else:
+    sys.stderr.write("FIXME: implement non-bridge networking\n")
+    sys.exit(1)
+
+# XXX: If not debug/foreground, daemonize
+
+# XXX: Probably don't need this anymore
+signal.signal(signal.SIGCHLD, sig_child)
+
+file_copier_thread = threading.Thread(target=file_copier)
+file_copier_thread.daemon = True
+file_copier_thread.start()
+
+vm_reaper_thread = threading.Thread(target=vm_reaper)
+vm_reaper_thread.daemon = True
+vm_reaper_thread.start()
+
+lease_updater_thread = threading.Thread(target=lease_updater)
+lease_updater_thread.daemon = True
+lease_updater_thread.start()
+
+if 'cli.listen.address' in config:
+    raw_cli_listener_thread = threading.Thread(target=raw_cli_listener)
+    raw_cli_listener_thread.daemon = True
+    raw_cli_listener_thread.start()
+
+if 'cli.listen.ssladdress' in config:
+    ssl_cli_listener_thread = threading.Thread(target=ssl_cli_listener)
+    ssl_cli_listener_thread.daemon = True
+    ssl_cli_listener_thread.start()
+
+if 'http.listen.address' in config:
+    raw_http_listener_thread = threading.Thread(target=raw_http_listener)
+    raw_http_listener_thread.daemon = True
+    raw_http_listener_thread.start()
+
+if 'http.listen.ssladdress' in config:
+    ssl_http_listener_thread = threading.Thread(target=ssl_http_listener)
+    ssl_http_listener_thread.daemon = True
+    ssl_http_listener_thread.start()
+
+while True:
+    time.sleep(1)
