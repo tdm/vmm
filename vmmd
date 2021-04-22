@@ -228,7 +228,7 @@ def readable_time(val):
 
 def parse_num(strval):
     idx = 0
-    while idx < len(strval) and strval[idx].isdigit():
+    while idx < len(strval) and (strval[idx] in '0123456789.'):
         idx += 1
     if idx < len(strval):
         factors = {
@@ -237,11 +237,11 @@ def parse_num(strval):
             'g': 1 << 30, 'gb': 1 << 30,
             't': 1 << 40, 'tb': 1 << 40,
         }
-        num = int(strval[:idx])
+        num = float(strval[:idx])
         suffix = strval[idx:].lower().strip()
         if not suffix in factors:
             raise RuntimeError('Bad numeric suffix')
-        return num * factors[suffix]
+        return int(num * factors[suffix])
     return int(strval)
 
 def mkdir_p(path, mode=None):
