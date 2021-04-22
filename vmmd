@@ -1899,7 +1899,6 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             if vm.running():
                 r += "    <tr><td style=\"font-weight:bold\">VNC<td>%s:%d\n" % (server_host, vm_id)
-                r += "    <tr><td style=\"font-weight:bold\">Serial<td>%s:%d\n" % (server_host, vm_id + 9000)
                 r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             r += '   </table>\n'
             r += '   <table>\n'
