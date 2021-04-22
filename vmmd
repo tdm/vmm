@@ -586,6 +586,7 @@ class NamedObjectDatabase:
         if not pathname:
             pathname = self._pathname
         f = open(pathname, 'w')
+        os.chmod(pathname, 0o0600)
         json.dump(vec, f, indent=2)
         f.close()
 
