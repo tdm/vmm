@@ -2303,6 +2303,7 @@ config_defaults = {
     'network.bridge.addr': '172.16.1.1/24',
     'network.dhcp.start': '172.16.1.2',
     'network.dhcp.end': '172.16.1.254',
+    'network.dns.server': '1.1.1.1',
     'network.proxy_arp_dev': 'eth0',
 
     'vm.nesting': True,
