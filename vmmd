@@ -2415,6 +2415,13 @@ if config['network.mode'] == 'bridge':
     except:
         # XXX: handle errors other than already exists
         pass
+    argv = [find_in_path('ip'),
+            'link', 'set', config['network.bridge.name'], 'up']
+    try:
+        cmd_run(argv)
+    except:
+        loge("Cannot activate bridge device")
+        sys.exit(1)
     if 'network.proxy_arp_dev' in config:
         pathname = "/proc/sys/net/ipv4/conf/%s/proxy_arp" % (config['network.proxy_arp_dev'])
         file_write(pathname, "1")
