@@ -81,6 +81,7 @@ import getopt
 import pwd
 import hashlib
 import random
+import string
 import threading
 import subprocess
 import signal
@@ -264,6 +265,12 @@ def sha256_bytes(val):
 
 def sha256_string(val):
     return sha256_bytes(val.encode())
+
+def pwgen(pwlen=8):
+    pw = ''
+    while len(pw) < pwlen:
+        pw += random.choice(string.ascii_letters + string.digits + '-.')
+    return pw
 
 def file_write(pathname, buf):
     f = open(pathname, 'w')
@@ -815,7 +822,7 @@ class Image(DbObject):
 ### VirtualMachine ###
 class VirtualMachine(DbObject):
     _oid_map = set()
-    def __init__(self, oid, name, owner, arch, cpus, mem, mac_addr, disk_pathname):
+    def __init__(self, oid, name, owner, arch, cpus, mem, mac_addr, vnc_password, disk_pathname):
         DbObject.__init__(self, oid)
         if mac_addr is None:
             # XXX: make this better
@@ -830,6 +837,8 @@ class VirtualMachine(DbObject):
                 mac_addr = "52:54:00:%02x:%02x:%02x" % (b4, b5, b6)
                 if not mac_addr in allocated:
                     found = True
+        if vnc_password is None:
+            vnc_password = pwgen(8)
         self._name = name
         self._owner = owner
         self._arch = arch
@@ -840,6 +849,7 @@ class VirtualMachine(DbObject):
         self._copy_status = None
         self._mac_addr = mac_addr
         self._pid = self._get_qemu_pid()
+        self._vnc_password = vnc_password
         self._iso_pathname = self._get_iso_pathname()
         self._ipv4addr = None
         self._ipv6addr = None
@@ -857,7 +867,7 @@ class VirtualMachine(DbObject):
                 '-o', 'preallocation=metadata',
                 disk_pathname, "%dG" % (disk_size)]
         cmd_run(argv)
-        return VirtualMachine(None, name, owner, arch, cpus, mem, None, disk_pathname)
+        return VirtualMachine(None, name, owner, arch, cpus, mem, None, None, disk_pathname)
 
     @staticmethod
     def create_from_image(name, owner, arch, cpus, mem, image_oid):
@@ -866,7 +876,7 @@ class VirtualMachine(DbObject):
         if img.type() != Image.TYPE_DISK:
             raise RuntimeError("Image is not a disk")
         disk_pathname = VirtualMachine.pathname_for_disk(owner.name(), name, img.extension())
-        vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, disk_pathname)
+        vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, None, disk_pathname)
         if img.extension() == '.qcow2':
             argv = [find_in_path('qemu-img'), 'create', '-f', 'qcow2', '-b', img.pathname(), disk_pathname]
             cmd_run(argv)
@@ -876,7 +886,7 @@ class VirtualMachine(DbObject):
 
     @staticmethod
     def create_from_local(name, owner, arch, cpus, mem, pathname):
-        return VirtualMachine(None, name, owner, arch, cpus, mem, None, pathname)
+        return VirtualMachine(None, name, owner, arch, cpus, mem, None, None, pathname)
 
     @staticmethod
     def create_from_upload(name, owner, arch, cpus, mem, filename, data):
@@ -891,7 +901,7 @@ class VirtualMachine(DbObject):
         # XXX: deal with LVM
         (root, ext) = os.path.splitext(image_url)
         disk_pathname = VirtualMachine.pathname_for_disk(owner.name(), name, ext)
-        vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, disk_pathname)
+        vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, None, disk_pathname)
         file_copy_async(image_url, None, disk_pathname, vm)
         return vm
 
@@ -903,6 +913,7 @@ class VirtualMachine(DbObject):
                               user_db.get_by_name(args['owner']),
                               args['arch'], args['cpus'], args['mem'],
                               args.get('mac_addr', None),
+                              args.get('vnc_password', None),
                               args['disk_pathname'])
     def serialize(self):
         return {
@@ -913,6 +924,7 @@ class VirtualMachine(DbObject):
                 'cpus' : self._cpus,
                 'mem'  : self._mem,
                 'mac_addr': self._mac_addr,
+                'vnc_password': self._vnc_password,
                 'disk_pathname' : self._disk_pathname,
         }
 
@@ -1034,7 +1046,7 @@ class VirtualMachine(DbObject):
                 '-m', "%dM" % self._mem,
                 '-monitor', "unix:%s/monitor,server,nowait" % (vm_run_dir),
                 '-serial', "unix:%s/serial,server,nowait" % (vm_run_dir),
-                '-vnc', ":%d" % (self.oid()),
+                '-vnc', ":%d,password=on" % (self.oid()),
                 '-usb',
                 '-device', 'usb-tablet',
                 '-netdev', "bridge,br=%s,id=net1" % (config['network.bridge.name']),
@@ -1060,6 +1072,8 @@ class VirtualMachine(DbObject):
         print("pid=%d" % (self._pid))
         if resuming:
             self._run_monitor_command('delvm vmm-suspend')
+        if self._vnc_password:
+            self._run_monitor_command("change vnc password %s" % (self._vnc_password))
 
     def _drain_monitor_socket(self, sock):
         buf = ''
@@ -1083,6 +1097,12 @@ class VirtualMachine(DbObject):
             line += '\n'
         sock.send(line.encode())
         return self._drain_monitor_socket(sock)
+
+    def vnc_password(self, val=None):
+        if not val is None:
+            self._vnc_password = val
+            self._run_monitor_command("change vnc password %s" % (self._vnc_password))
+        return self._vnc_password
 
     def iso_pathname(self):
         return self._iso_pathname
@@ -1898,7 +1918,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += "    <tr><td style=\"font-weight:bold\">Addr<td>%s\n" % (vm.ipv4addr())
             r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             if vm.running():
-                r += "    <tr><td style=\"font-weight:bold\">VNC<td>%s:%d\n" % (server_host, vm_id)
+                r += "    <tr><td style=\"font-weight:bold\">VNC Host<td>%s:%d\n" % (server_host, vm_id)
+                r += "    <tr><td style=\"font-weight:bold\">VNC Pass<td>%s\n" % (vm.vnc_password())
                 r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             r += '   </table>\n'
             r += '   <table>\n'
