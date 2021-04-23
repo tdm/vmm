@@ -702,43 +702,31 @@ class User(DbObject):
 
 ### Image ###
 class Image(DbObject):
-    TYPE_NONE = 0
-    TYPE_ISO = 1
-    TYPE_DISK = 2
     _oid_map = set()
-    def __init__(self, oid, name, pathname, owner, public=False, type_name=None):
+    def __init__(self, oid, name, pathname, owner, public=False):
         DbObject.__init__(self, oid)
         self._name = name
         self._pathname = pathname
         self._copy_status = None
         self._owner = owner
         self._public = public
-        self._type = Image.TYPE_NONE
-        if not type_name:
-            (base, ext) = os.path.splitext(pathname)
-            if ext.lower() in ['.iso']:
-                type_name = 'iso'
-            if ext.lower() in ['.qcow2', '.vmdk']:
-                type_name = 'disk'
-        if type_name.lower() == 'iso':
-            self._type = Image.TYPE_ISO
-        if type_name.lower() == 'disk':
-            self._type = Image.TYPE_DISK
+        self._fmt = None
+        self._physical_size = None
+        self._virtual_size = None
         self._ref = 0
-        self._size = None
+        self._get_info()
     @staticmethod
     def deserialize(args):
         owner = user_db.get_by_name(args['owner'])
         return Image(args['oid'], args['name'],
-                     args['pathname'], owner, args['public'], args['type'])
+                     args['pathname'], owner, args['public'])
     def serialize(self):
         return {
                 'oid'     : self._oid,
                 'name'    : self._name,
                 'pathname': self._pathname,
                 'owner'   : self._owner.name(),
-                'public'  : self._public,
-                'type'    : self.type_name()
+                'public'  : self._public
         }
 
     @staticmethod
@@ -775,6 +763,40 @@ class Image(DbObject):
         file_copy_async(vm.disk_pathname(), vm, img.pathname(), img)
         return img
 
+    def _get_info(self):
+        try:
+            sb = os.stat(self.pathname())
+            self._physical_size = (sb.st_blocks * 512) / ONE_MB
+            self._virtual_size = sb.st_size / ONE_MB
+        except OSError as e:
+            return
+        out = None
+        try:
+            argv = [find_in_path('qemu-img'), 'info', '-U', self.pathname()]
+            (out, err) = cmd_run(argv)
+        except RuntimeError as e:
+            (root, ext) = os.path.splitext(self.pathname())
+            self._fmt = ext[1:]
+            return
+        for line in out.rstrip('\n').split('\n'):
+            if line.find(':') == -1:
+                continue
+            (k, v) = line.split(':', 1)
+            v = v.strip()
+            if k == 'file format':
+                self._fmt = v
+                if v == 'raw':
+                    f = open(self.pathname(), 'rb')
+                    f.seek(0x8000)
+                    buf = f.read(6)
+                    f.close()
+                    if buf == b'\x01CD001':
+                        self._fmt = 'iso'
+            if k == 'virtual size':
+                i1 = v.find('(') + 1
+                i2 = v.find(' ', i1)
+                self._virtual_size = int(v[i1:i2]) / ONE_MB
+
     def name(self, val=None):
         if not val is None:
             self._name = val
@@ -795,14 +817,16 @@ class Image(DbObject):
         if not val is None:
             self._public = val
         return self._public
+    def fmt(self):
+        return self._fmt
+    def physical_size(self):
+        sb = os.stat(self.pathname())
+        self._physical_size = (sb.st_blocks * 512) / ONE_MB
+        return self._physical_size
+    def virtual_size(self):
+        return self._virtual_size
     def type(self):
-        return self._type
-    def type_name(self):
-        if self._type == Image.TYPE_ISO:
-            return 'iso'
-        if self._type == Image.TYPE_DISK:
-            return 'disk'
-        raise RuntimeError("Invalid image type: %s" % (self._type))
+        return 'iso' if self._fmt == 'iso' else 'disk'
     def extension(self):
         (root, ext) = os.path.splitext(self._pathname)
         return ext
@@ -811,14 +835,6 @@ class Image(DbObject):
     def decref(self):
         assert self._ref > 0
         self._ref -= 1
-    def size(self):
-        if self._size is None:
-            try:
-                sb = os.stat(self._pathname)
-                self._size = sb.st_size / ONE_MB
-            except OSError as e:
-                pass
-        return self._size
 
 ### VirtualMachine ###
 class VirtualMachine(DbObject):
@@ -874,7 +890,7 @@ class VirtualMachine(DbObject):
     def create_from_image(name, owner, arch, cpus, mem, image_oid):
         # XXX: deal with LVM
         img = image_db.get_by_oid(image_oid)
-        if img.type() != Image.TYPE_DISK:
+        if img.type() != 'disk':
             raise RuntimeError("Image is not a disk")
         disk_pathname = VirtualMachine.pathname_for_disk(owner.name(), name, img.extension())
         vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, None, disk_pathname)
@@ -1465,7 +1481,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r += '<select name="iso_image">'
         r += '<option value=""></option>'
         for oid, img in image_db.items():
-            if img.type() != Image.TYPE_ISO:
+            if img.type() != 'iso':
                 continue
             r += "<option value=\"%d\">%s</option>" % (oid, img.name())
         r += '</select>'
@@ -1476,7 +1492,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r += '<select name="disk_image">'
         r += '<option value=""></option>'
         for oid, img in image_db.items():
-            if img.type() != Image.TYPE_DISK:
+            if img.type() != 'disk':
                 continue
             if img.oid() == img_id:
                 r += "<option value=\"%d\" selected=\"true\">%s</option>" % (oid, img.name())
@@ -1557,7 +1573,6 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             msg = None
             img_id = int(args['id'][0])
             img = image_db.get_by_oid(img_id)
-            type_name = img.type_name()
             edit_mode = ('action' in args) and (args['action'][0] == 'Edit')
             if 'action' in args:
                 if args['action'][0] == 'Save':
@@ -1568,7 +1583,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     msg = 'Settings saved'
                 if args['action'][0] == 'Delete':
                     image_db.remove(img)
-                    self._send_response(302, {'Location': '/ui/image'}, None)
+                    path = "/ui/image?type=%s" % (img.type())
+                    self._send_response(302, {'Location': path}, None)
                     return
             r += "  <p style=\"font-size:150%%\">%s</p>\n" % (img.name())
             if msg:
@@ -1576,7 +1592,6 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             if err:
                 r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (errmsg)
             r += '  <form method="POST" action="/ui/image">\n'
-            r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (type_name)
             r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (img_id)
             r += '   <table>\n'
             if edit_mode:
@@ -1588,16 +1603,17 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 val = 'Public' if img.public() else 'Private'
                 r += "    <tr><td style=\"font-weight:bold\">Visibility<td>%s\n" % (val)
                 r += '    <tr><td><input type="submit" name="action" value="Edit"><td>&nbsp;\n'
-            r += "    <tr><td style=\"font-weight:bold\">Size<td>%s\n" % (readable_size(img.size(), ONE_MB))
+            r += "    <tr><td style=\"font-weight:bold\">Virtual Size<td>%s\n" % (readable_size(img.virtual_size(), ONE_MB))
+            r += "    <tr><td style=\"font-weight:bold\">Physical Size<td>%s\n" % (readable_size(img.physical_size(), ONE_MB))
             r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             r += '    <tr><td><input style="color:red" type="submit" name="action" value="Delete"><td>&nbsp;'
             r += '   </table>\n'
             r += '  </form>\n'
         else:
-            type_name = args['type'][0] if 'type' in args else 'Unknown'
-            r += "  <p style=\"font-size:150%%\">%s Images</p>\n" % (type_name)
+            imgtype = args['type'][0] if 'type' in args else 'Unknown'
+            r += "  <p style=\"font-size:150%%\">%s Images</p>\n" % (imgtype)
             r += '  <form method="GET" action="/ui/image/create">\n'
-            r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (type_name)
+            r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (imgtype)
             r += '   <table width="100%">\n'
             r += '    <tr>\n'
             r += '     <td><input type="submit" value="Create">\n'
@@ -1608,7 +1624,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             idx = -1
             for oid, img in image_db.items():
                 bgcolor = '#e0e0e0' if (idx % 2) == 0 else 'initial'
-                if img.type_name() != type_name:
+                if img.type() != imgtype:
                     continue
                 if img.owner().name() != user.name() and not img.public() and not user.in_group('admin'):
                     continue
@@ -1618,7 +1634,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 r += "<td>%s" % (img.owner().name())
                 r += "<td>%s" % ('Public' if  img.public() else 'Private')
                 if not img.copying():
-                    if img.type() == Image.TYPE_DISK:
+                    if img.type() == 'disk':
                         r += "<td><a href=\"/ui/vm/create?img_id=%d\">Launch</a>" % (img.oid())
                     else:
                         r += "<td>&nbsp;"
