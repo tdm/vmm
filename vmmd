@@ -1423,6 +1423,9 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r += '<html>\n'
         r += ' <head>\n'
         r += '  <title>Virtual Machine Manager</title>\n'
+        r += '  <style>\n'
+        r += '   a { color: blue; text-decoration: none; }\n'
+        r += '  </style>\n'
         r += ' </head>\n'
         r += ' <body>\n'
         r += ' <table width="100%">\n'
@@ -1430,7 +1433,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r += '   <td width="33%">&nbsp;\n'
         r += "   <td width=\"33%%\" align=\"center\"><img src=\"%s/logo.jpg\" alt=\"logo\">\n" % (config['ui.imagepath'])
         if user:
-            r += "   <td width=\"33%%\" align=\"right\" valign=\"top\">%s<br><a style=\"text-decoration:none\" href=\"/ui/logout\">logout</a>\n" % (user.fullname())
+            r += "   <td width=\"33%%\" align=\"right\" valign=\"top\">%s<br><a href=\"/ui/logout\">logout</a>\n" % (user.fullname())
         else:
             r += '   <td width="33%">&nbsp;\n'
         r += '  <tr>\n'
@@ -1446,15 +1449,15 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             if user.in_group('admin'):
                 r += '    <p style="color:red">Admin</p>\n'
                 r += '    <hr>\n'
-            r += '    <a style="text-decoration:none" href="/ui">Overview</a><br>\n'
+            r += '    <a href="/ui">Overview</a><br>\n'
             r += '    <br>\n'
-            r += '    <a style="text-decoration:none" href="/ui/vm">Virtual Machines</a><br>\n'
+            r += '    <a href="/ui/vm">Virtual Machines</a><br>\n'
             r += '    <br>\n'
-            r += '    <a style="text-decoration:none" href="/ui/image?type=disk">Disk Images</a><br>\n'
+            r += '    <a href="/ui/image?type=disk">Disk Images</a><br>\n'
             r += '    <br>\n'
-            r += '    <a style="text-decoration:none" href="/ui/image?type=iso">ISO Images</a><br>\n'
+            r += '    <a href="/ui/image?type=iso">ISO Images</a><br>\n'
             r += '    <br>\n'
-            r += '    <a style="text-decoration:none" href="/ui/user">Settings</a><br>\n'
+            r += '    <a href="/ui/user">Settings</a><br>\n'
             r += '    <br>\n'
             r += '   <td align="left" valign="top">\n'
         return r
