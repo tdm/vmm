@@ -305,6 +305,43 @@ def image_pathname(root, name, ext):
         pathname += ext
     return pathname
 
+def image_info(pathname):
+    physical_size = None
+    virtual_size = None
+    (root, ext) = os.path.splitext(pathname)
+    format = ext[1:]
+    try:
+        sb = os.stat(pathname)
+        physical_size = (sb.st_blocks * 512) / ONE_MB
+        virtual_size = sb.st_size / ONE_MB
+    except OSError as e:
+        pass
+    out = ''
+    try:
+        argv = [find_in_path('qemu-img'), 'info', '-U', pathname]
+        (out, err) = cmd_run(argv)
+    except RuntimeError as e:
+        pass
+    for line in out.rstrip('\n').split('\n'):
+        if line.find(':') == -1:
+            continue
+        (k, v) = line.split(':', 1)
+        v = v.strip()
+        if k == 'file format':
+            format = v
+            if v == 'raw':
+                f = open(pathname, 'rb')
+                f.seek(0x8000)
+                buf = f.read(6)
+                f.close()
+                if buf == b'\x01CD001':
+                    format = 'iso'
+        if k == 'virtual size':
+            i1 = v.find('(') + 1
+            i2 = v.find(' ', i1)
+            virtual_size = int(v[i1:i2]) / ONE_MB
+    return (physical_size, virtual_size, format)
+
 # XXX: cache results
 def find_in_path(name):
     for dir in os.environ["PATH"].split(":"):
@@ -710,11 +747,8 @@ class Image(DbObject):
         self._copy_status = None
         self._owner = owner
         self._public = public
-        self._fmt = None
-        self._physical_size = None
-        self._virtual_size = None
+        (self._physical_size, self._virtual_sie, self._fmt) = image_info(pathname)
         self._ref = 0
-        self._get_info()
     @staticmethod
     def deserialize(args):
         owner = user_db.get_by_name(args['owner'])
@@ -762,40 +796,6 @@ class Image(DbObject):
         img = Image(None, name, pathname, user, public)
         file_copy_async(vm.disk_pathname(), vm, img.pathname(), img)
         return img
-
-    def _get_info(self):
-        try:
-            sb = os.stat(self.pathname())
-            self._physical_size = (sb.st_blocks * 512) / ONE_MB
-            self._virtual_size = sb.st_size / ONE_MB
-        except OSError as e:
-            return
-        out = None
-        try:
-            argv = [find_in_path('qemu-img'), 'info', '-U', self.pathname()]
-            (out, err) = cmd_run(argv)
-        except RuntimeError as e:
-            (root, ext) = os.path.splitext(self.pathname())
-            self._fmt = ext[1:]
-            return
-        for line in out.rstrip('\n').split('\n'):
-            if line.find(':') == -1:
-                continue
-            (k, v) = line.split(':', 1)
-            v = v.strip()
-            if k == 'file format':
-                self._fmt = v
-                if v == 'raw':
-                    f = open(self.pathname(), 'rb')
-                    f.seek(0x8000)
-                    buf = f.read(6)
-                    f.close()
-                    if buf == b'\x01CD001':
-                        self._fmt = 'iso'
-            if k == 'virtual size':
-                i1 = v.find('(') + 1
-                i2 = v.find(' ', i1)
-                self._virtual_size = int(v[i1:i2]) / ONE_MB
 
     def name(self, val=None):
         if not val is None:
@@ -862,7 +862,7 @@ class VirtualMachine(DbObject):
         self._cpus = cpus
         self._mem = mem
         self._disk_pathname = disk_pathname
-        self._disk_size = None
+        (self._disk_psize, self._disk_vsize, self._disk_fmt) = image_info(disk_pathname)
         self._copy_status = None
         self._mac_addr = mac_addr
         self._pid = self._get_qemu_pid()
@@ -1006,14 +1006,15 @@ class VirtualMachine(DbObject):
         return self._mem
     def disk_pathname(self):
         return self._disk_pathname
-    def disk_size(self):
-        if self._disk_size is None:
-            try:
-                sb = os.stat(self._disk_pathname)
-                self._disk_size = sb.st_size / ONE_MB
-            except OSError as e:
-                pass
-        return self._disk_size
+    def disk_physical_size(self):
+        try:
+            sb = os.stat(self._disk_pathname)
+            self._disk_psize = (sb.st_blocks * 512) / ONE_MB
+        except OSError as e:
+            pass
+        return self._disk_psize
+    def disk_virtual_size(self):
+        return self._disk_vsize
     def copying(self, val=None):
         if not val is None:
             self._copy_status = 0 if val else None
@@ -1544,25 +1545,28 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         self._send_response(302, {'Set-Cookie': cookie, 'Location': '/ui/login'}, None)
 
     def ui_overview(self, user, args):
-        total = { 'cpus': 0, 'mem': 0, 'disk': 0 }
-        active = { 'cpus': 0, 'mem': 0, 'disk': 0 }
+        total = { 'cpus': 0, 'mem': 0, 'phys_disk': 0, 'virt_disk': 0 }
+        active = { 'cpus': 0, 'mem': 0, 'phys_disk': 0, 'virt_disk': 0 }
         for oid, vm in vm_db.items():
             if vm.owner().name() != user.name() and not user.in_group('admin'):
                 continue
             total['cpus'] += vm.cpus()
             total['mem'] += vm.mem()
-            total['disk'] += vm.disk_size()
+            total['phys_disk'] += vm.disk_physical_size()
+            total['virt_disk'] += vm.disk_virtual_size()
             if vm.running():
                 active['cpus'] += vm.cpus()
                 active['mem'] += vm.mem()
-                active['disk'] += vm.disk_size()
+                active['phys_disk'] += vm.disk_physical_size()
+                active['virt_disk'] += vm.disk_virtual_size()
         r = self._html_head(user)
         r += '  <p style="font-size:150%">Overview</p>\n'
         r += '  <table width="100%">\n'
         r += '   <tr><td>&nbsp;<td style="font-weight:bold">Active<td style="font-weight:bold">Total\n'
         r += "   <tr><td style=\"font-weight:bold\">CPUs<td>%d<td>%d\n" % (active['cpus'], total['cpus'])
         r += "   <tr><td style=\"font-weight:bold\">Memory<td>%s<td>%s\n" % (readable_size(active['mem'], ONE_MB), readable_size(total['mem'], ONE_MB))
-        r += "   <tr><td style=\"font-weight:bold\">Disk<td>%s<td>%s\n" % (readable_size(active['disk'], ONE_MB), readable_size(total['disk'], ONE_MB))
+        r += "   <tr><td style=\"font-weight:bold\">Physical Disk<td>%s<td>%s\n" % (readable_size(active['phys_disk'], ONE_MB), readable_size(total['phys_disk'], ONE_MB))
+        r += "   <tr><td style=\"font-weight:bold\">Virtual Disk<td>%s<td>%s\n" % (readable_size(active['virt_disk'], ONE_MB), readable_size(total['virt_disk'], ONE_MB))
         r += '  </table>\n'
         r += self._html_foot(user)
         self._send_response(200, None, r)
@@ -1932,7 +1936,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 r += "    <tr><td style=\"font-weight:bold\">Mem<td>%s\n" % (readable_size(vm.mem(), ONE_MB))
                 if not vm.running():
                     r += '    <tr><td><input type="submit" name="action" value="Edit"><td>&nbsp;\n'
-            r += "    <tr><td style=\"font-weight:bold\">Disk<td>%s\n" % (readable_size(vm.disk_size(), ONE_MB))
+            r += "    <tr><td style=\"font-weight:bold\">Disk<td>%s\n" % (readable_size(vm.disk_virtual_size(), ONE_MB))
             r += "    <tr><td style=\"font-weight:bold\">State<td>%s\n" % (vm.state())
             r += "    <tr><td style=\"font-weight:bold\">MAC<td>%s\n" % (vm.macaddr())
             r += "    <tr><td style=\"font-weight:bold\">Addr<td>%s\n" % (vm.ipv4addr())
