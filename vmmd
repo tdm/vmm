@@ -1510,7 +1510,10 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += "    <tr><td style=\"font-weight:bold\">Virtual Size<td>%s\n" % (readable_size(img.virtual_size(), ONE_MB))
             r += "    <tr><td style=\"font-weight:bold\">Physical Size<td>%s\n" % (readable_size(img.physical_size(), ONE_MB))
             r += '    <tr><td>&nbsp;<td>&nbsp;\n'
-            r += '    <tr><td><input style="color:red" type="submit" name="action" value="Delete"><td>&nbsp;'
+            if img.copying():
+                r += '   <tr><td style="font-weight:bold">Copying<td>&nbsp;\n'
+            else:
+                r += '    <tr><td><input style="color:red" type="submit" name="action" value="Delete"><td>&nbsp;'
             r += '   </table>\n'
             r += '  </form>\n'
         else:
