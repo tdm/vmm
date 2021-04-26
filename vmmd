@@ -965,6 +965,10 @@ class VirtualMachine(DbObject):
             argv.extend(['-cdrom', self._iso_pathname, '-boot', 'd'])
         if resuming:
             argv.extend(['-loadvm', 'vmm-suspend'])
+        try:
+            os.unlink(self._qemu_pidfile())
+        except OSError as e:
+            pass
         fork_child(argv)
         tries = 0
         while tries < 20 and not os.path.exists(self._qemu_pidfile()):
