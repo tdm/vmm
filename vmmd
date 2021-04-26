@@ -98,7 +98,7 @@ import urllib.request
 
 import email.parser
 import email.policy
-#import sqlite3
+import sqlite3
 
 import traceback
 
@@ -124,9 +124,11 @@ gid = os.getgid()
 pid = os.getpid()
 tmp_dir = os.environ.get('TMPDIR', '/tmp')
 
-user_db = None
-image_db = None
-vm_db = None
+users_table = None
+images_table = None
+vms_table = None
+
+leases = {}
 
 ### Misc utilities ###
 
@@ -568,204 +570,152 @@ class ScopedLocker:
 
 ### DbObject ###
 class DbObject:
-    def __init__(self, oid):
-        if oid is None:
-            oid = 1
-            while oid in self.__class__._oid_map:
-                oid += 1
-        if oid in self.__class__._oid_map:
-            raise RuntimeError("Duplicate object in database")
-        self.__class__._oid_map.add(oid)
-        self._oid = oid
-        self._lock = threading.Lock()
-    def __del__(self):
-        self.__class__._oid_map.remove(self._oid)
+    def __init__(self, row=None):
+        self._dict = {}
+        self._changed = set()
+        if row:
+            for k in row.keys():
+                self._dict[k] = row[k]
+
+    def keys(self):
+        return self._dict.keys()
+
+    def values(self):
+        return self._dict.values()
+
+    def __getitem__(self, name):
+        return self._dict[name]
+
+    def get(self, name, default):
+        if name in self._dict:
+            return self._dict[name]
+        return default
+
+    def __setitem__(self, name, val):
+        self._changed.add(name)
+        self._dict[name] = val
+
     def oid(self):
-        return self._oid
+        return self._dict['id']
 
-### NamedObjectDatabase ###
-class NamedObjectDatabase:
-    def __init__(self, classobj, pathname=None):
+class DbTable:
+    def __init__(self, dbconn, name, sql):
+        self._dbconn = dbconn
+        self._name = name
         self._lock = threading.Lock()
-        self._classobj = classobj
-        self._pathname = pathname
-        self._obj_by_oid = {}
-        self._obj_by_name = {}
-        if pathname:
-            self.load()
+        query = "CREATE TABLE IF NOT EXISTS %s (%s)" % (self._name, sql)
+        self._dbconn.execute(query)
 
-    def load(self, pathname=None):
-        self._obj_by_oid = {}
-        self._obj_by_name = {}
-        if not pathname:
-            pathname = self._pathname
-        try:
-            f = open(pathname, 'r')
-        except IOError as e:
-            if e.errno == errno.ENOENT:
-                return
-            raise
-        try:
-            vec = json.load(f)
-        except json.decoder.JSONDecodeError as e:
-            os.remove(pathname)
-            return
-        f.close()
-        for elem in vec:
-            obj = self._classobj.deserialize(elem)
-            self._obj_by_oid[obj.oid()] = obj
-            self._obj_by_name[obj.name()] = obj
-
-    def save(self, pathname=None):
-        vec = []
-        for k,v in self._obj_by_oid.items():
-            vec.append(v.serialize())
-        if not pathname:
-            pathname = self._pathname
-        f = open(pathname, 'w')
-        os.chmod(pathname, 0o0600)
-        json.dump(vec, f, indent=2)
-        f.close()
-
-    def items(self):
-        return self._obj_by_oid.items()
-
-    def length(self):
-        return len(self._obj_by_oid)
     def empty(self):
-        return self.length() == 0
-    def get_by_oid(self, oid, default=None):
-        return self._obj_by_oid.get(oid, default)
-    def get_by_name(self, name, default=None):
-        return self._obj_by_name.get(name, default)
+        query = "SELECT COUNT(*) FROM %s" % (self._name)
+        cursor = self._dbconn.execute(query)
+        row = cursor.fetchone()
+        return row[0] == 0
+
+    def select_all(self):
+        locker = ScopedLocker(self._lock)
+        obj = None
+        query = "SELECT * from %s" % (self._name)
+        return dbconn.execute(query)
+
+    def select_where(self, wherestr):
+        locker = ScopedLocker(self._lock)
+        obj = None
+        query = "SELECT * from %s WHERE %s" % (self._name, wherestr)
+        res = dbconn.execute(query)
+        if res is None:
+            res = []
+        return res
+
+    def select_one_where(self, wherestr):
+        res = self.select_where(wherestr)
+        row = None
+        n = 0
+        for row in res:
+            n += 1
+        if n != 1:
+            raise RuntimeError("Unexpected row count")
+        return row
+
+    def select_by_oid(self, oid):
+        res = self.select_where("id=%d" % (oid))
+        if not res:
+            return None
+        return res.fetchone()
+
+    def select_by_name(self, name):
+        res = self.select_where("name='%s'" % (name))
+        if not res:
+            return None
+        return res.fetchone()
+
     def insert(self, obj):
-        self._obj_by_oid[obj.oid()] = obj
-        self._obj_by_name[obj.name()] = obj
-        self.save()
-    def remove(self, obj):
-        del self._obj_by_oid[obj.oid()]
-        del self._obj_by_name[obj.name()]
-        self.save()
+        locker = ScopedLocker(self._lock)
+        keystr = ','.join(obj.keys())
+        valstr = ','.join(["'%s'" % (v) for v in obj.values()])
+        query = "INSERT INTO %s (%s) values (%s)" % (self._name, keystr, valstr)
+        print("query=%s" % (query))
+        cursor = dbconn.execute(query)
+        obj['id'] = cursor.lastrowid
+        print("id=%d" % (cursor.lastrowid))
+
+    def update(self, obj):
+        if not obj._changed:
+            return
+        locker = ScopedLocker(self._lock)
+        query = "UPDATE %s SET " % (self._name)
+        change_vec = []
+        for k in obj._changed:
+            if k == 'id':
+                continue
+            change_vec.append("%s='%s'" % (k, obj._dict[k]))
+        query += ','.join(change_vec)
+        query += " WHERE id=%d" % (obj._dict['id'])
+        self._dbconn.execute(query)
+        obj._changed = set()
+
+    def delete(self, obj):
+        locker = ScopedLocker(self._lock)
+        query = "DELETE FROM %s WHERE id=%d" % (self._name, obj['id'])
+        self._dbconn.execute(query)
 
 ### User ###
 class User(DbObject):
-    _oid_map = set()
-    _sessions = dict()
-    def __init__(self, oid, name, fullname, pwhash, groups, email, timezone, token, localuid):
-        DbObject.__init__(self, oid)
-        self._name = name
-        self._fullname = fullname
-        self._pwhash = pwhash
-        self._groups = groups
-        self._email = email
-        self._timezone = timezone
-        self._token = token
-        self._localuid = localuid
-    @staticmethod
-    def deserialize(args):
-        return User(args['oid'], args['name'], args['fullname'], args['pwhash'],
-                    args['groups'], args['email'], args['timezone'], args['token'],
-                    args['localuid'])
-    def serialize(self):
-        return {
-                'oid'     : self._oid,
-                'name'    : self._name,
-                'fullname': self._fullname,
-                'pwhash'  : self._pwhash,
-                'groups'  : self._groups,
-                'email'   : self._email,
-                'timezone': self._timezone,
-                'token'   : self._token,
-                'localuid': self._localuid
-        }
+    def __init__(self, row):
+        DbObject.__init__(self, row)
     @staticmethod
     def create(name, fullname, password, groups):
-        return User(None, name, fullname, sha256_string(password), groups, None, None, None, None)
+        return User({'name': name, 'fullname': fullname,
+                     'pwhash': sha256_string(password), 'groups': groups})
 
     def create_session(self):
-        self._session = sha256_string("%s%s%s" % (self.name(), self.pwhash(), time.time()))
-        User._sessions[self._session] = self
-        return self._session
-    def remove_session(self):
-        del User._sessions[self._session]
-        self._session = None
-    @staticmethod
-    def get_from_session(session):
-        return User._sessions.get(session, None)
-
-    def name(self):
-        return self._name
-    def fullname(self, val=None):
-        if not val is None:
-            self._fullname = val
-        return self._fullname
-    def pwhash(self):
-        return self._pwhash
-    def password(self, val):
-        self._pwhash = sha256_string(val)
-    def groups(self, val=None):
-        if not val is None:
-            self._groups = val
-        return self._groups
-    def email(self, val=None):
-        if not val is None:
-            self._email = val
-        return self._email
-    def timezone(self, val=None):
-        if not val is None:
-            self._timezone = val
-        return self._timezone
-    def token(self, val=None):
-        if not val is None:
-            self._token = val
-        return self._token
-    def localuid(self, val=None):
-        if not val is None:
-            self._localuid = val
-        return self._localuid
+        self['session'] = sha256_string("%s%s%s" % (self['name'], self['pwhash'], time.time()))
+        return self['session']
 
     def auth_password(self, password):
         pwhash = sha256_string(password)
-        return pwhash == self._pwhash
+        return pwhash == self['pwhash']
 
     def in_group(self, group):
-        return group in self._groups
+        return group in self['groups'].split(':')
 
     def may_access_file(self, pathname):
-        if not self.localuid():
+        if not self['localuid']:
             return False
         sb = os.stat(pathname)
-        return sb.st_uid == self._localuid
+        return sb.st_uid == self['localuid']
 
 ### Image ###
 class Image(DbObject):
     _oid_map = set()
-    def __init__(self, oid, name, pathname, owner, public=False):
-        DbObject.__init__(self, oid)
-        self._name = name
-        self._pathname = pathname
+    def __init__(self, row):
+        DbObject.__init__(self, row)
         self._copy_status = None
-        self._owner = owner
-        self._public = public
-        (self._physical_size, self._virtual_sie, self._fmt) = image_info(pathname)
+        (self._physical_size, self._virtual_size, self._fmt) = image_info(self['pathname'])
         self._ref = 0
     @staticmethod
-    def deserialize(args):
-        owner = user_db.get_by_name(args['owner'])
-        return Image(args['oid'], args['name'],
-                     args['pathname'], owner, args['public'])
-    def serialize(self):
-        return {
-                'oid'     : self._oid,
-                'name'    : self._name,
-                'pathname': self._pathname,
-                'owner'   : self._owner.name(),
-                'public'  : self._public
-        }
-
-    @staticmethod
     def create_from_local(name, pathname, user, public):
-        return Image(None, name, pathname, user, public)
+        return Image({'name': name, 'pathname': pathname, 'owner': user['name'], 'public': public})
 
     @staticmethod
     def create_from_upload(name, filename, data, user, public):
@@ -784,52 +734,31 @@ class Image(DbObject):
             pathname = "%s/%s" % (config['iso.storage.location'], os.path.basename(url))
         else:
             pathname = "%s/%s" % (config['image.storage.location'], os.path.basename(url))
-        img = Image(None, name, pathname, user, public)
+        img = Image({'name': name, 'pathname': pathname, 'owner': user['name'], 'public': public})
         print("Image: add %s to fetch queue" % (url))
-        file_copy_async(url, None, pathname, img)
+        file_copy_async(url, pathname)
         return img
 
     @staticmethod
     def create_from_vmdisk(name, vm, user, public):
         filename = os.path.basename(vm.disk_pathname())
         pathname = "%s/%s" % (config['image.storage.location'], filename)
-        img = Image(None, name, pathname, user, public)
-        file_copy_async(vm.disk_pathname(), vm, img.pathname(), img)
+        img = Image({'name': name, 'pathname': pathname, 'owner': user['name'], 'public': public})
+        file_copy_async(vm.disk_pathname(), img.pathname())
         return img
 
-    def name(self, val=None):
-        if not val is None:
-            self._name = val
-        return self._name
-    def pathname(self):
-        return self._pathname
-    def copying(self, val=None):
-        if not val is None:
-            self._copy_status = 0 if val else None
-        return (not self._copy_status is None)
-    def copy_pct(self, val=None):
-        if not val is None:
-            self._copy_status = val
-        return self._copy_status if self._copy_status else 100
-    def owner(self):
-        return self._owner
-    def public(self, val=None):
-        if not val is None:
-            self._public = val
-        return self._public
+    def copying(self):
+        return self['pathname'] in file_copy_map
     def fmt(self):
         return self._fmt
     def physical_size(self):
-        sb = os.stat(self.pathname())
+        sb = os.stat(self['pathname'])
         self._physical_size = (sb.st_blocks * 512) / ONE_MB
         return self._physical_size
     def virtual_size(self):
         return self._virtual_size
     def type(self):
         return 'iso' if self._fmt == 'iso' else 'disk'
-    def extension(self):
-        (root, ext) = os.path.splitext(self._pathname)
-        return ext
     def incref(self):
         self._ref += 1
     def decref(self):
@@ -838,14 +767,14 @@ class Image(DbObject):
 
 ### VirtualMachine ###
 class VirtualMachine(DbObject):
-    _oid_map = set()
-    def __init__(self, oid, name, owner, arch, cpus, mem, mac_addr, vnc_password, disk_pathname):
-        DbObject.__init__(self, oid)
-        if mac_addr is None:
+    def __init__(self, row):
+        DbObject.__init__(self, row)
+        self._lock = threading.Lock()
+        if self['macaddr'] is None:
             # XXX: make this better
             allocated = set()
-            for oid, vm in vm_db.items():
-                allocated.add(vm._mac_addr)
+            for row in vms_table.select_all():
+                allocated.add(row['macaddr'])
             found = False
             while not found:
                 b4 = int(random.random() * 256)
@@ -854,22 +783,13 @@ class VirtualMachine(DbObject):
                 mac_addr = "52:54:00:%02x:%02x:%02x" % (b4, b5, b6)
                 if not mac_addr in allocated:
                     found = True
-        if vnc_password is None:
-            vnc_password = pwgen(8)
-        self._name = name
-        self._owner = owner
-        self._arch = arch
-        self._cpus = cpus
-        self._mem = mem
-        self._disk_pathname = disk_pathname
-        (self._disk_psize, self._disk_vsize, self._disk_fmt) = image_info(disk_pathname)
+            self['macaddr'] = mac_addr
+        if self['vncpass'] is None:
+            self['vncpass'] = pwgen(8)
+        (self._disk_psize, self._disk_vsize, self._disk_fmt) = image_info(self['diskpath'])
         self._copy_status = None
-        self._mac_addr = mac_addr
         self._pid = self._get_qemu_pid()
-        self._vnc_password = vnc_password
         self._iso_pathname = self._get_iso_pathname()
-        self._ipv4addr = None
-        self._ipv6addr = None
 
     @staticmethod
     def pathname_for_disk(username, vmname, ext):
@@ -878,32 +798,38 @@ class VirtualMachine(DbObject):
     @staticmethod
     def create_new(name, owner, arch, cpus, mem, disk_size):
         # XXX: deal with LVM
-        disk_pathname = VirtualMachine.pathname_for_disk(owner.name(), name, '.qcow2')
+        diskpath = VirtualMachine.pathname_for_disk(owner['name'], name, '.qcow2')
         argv = [find_in_path('qemu-img'), 'create',
                 '-f', 'qcow2',
                 '-o', 'preallocation=metadata',
-                disk_pathname, "%dG" % (disk_size)]
+                diskpath, "%dG" % (disk_size)]
         cmd_run(argv)
-        return VirtualMachine(None, name, owner, arch, cpus, mem, None, None, disk_pathname)
+        return VirtualMachine({'name': name, 'owner': owner['name'],
+                               'arch': arch, 'cpus': cpus, 'mem': mem,
+                               'diskpath': diskpath, 'macaddr': None, 'vncpass': None})
 
     @staticmethod
     def create_from_image(name, owner, arch, cpus, mem, image_oid):
         # XXX: deal with LVM
-        img = image_db.get_by_oid(image_oid)
-        if img.type() != 'disk':
-            raise RuntimeError("Image is not a disk")
-        disk_pathname = VirtualMachine.pathname_for_disk(owner.name(), name, img.extension())
-        vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, None, disk_pathname)
-        if img.extension() == '.qcow2':
-            argv = [find_in_path('qemu-img'), 'create', '-f', 'qcow2', '-b', img.pathname(), disk_pathname]
+        img = disk_images_table.select_by_oid(image_oid)
+        (root, ext) = os.path.splitext(img['pathname'])
+        diskpath = VirtualMachine.pathname_for_disk(owner['name'], name, ext)
+        if ext == '.qcow2':
+            argv = [find_in_path('qemu-img'), 'create', '-f', 'qcow2', '-b', img['pathname'], diskpath]
             cmd_run(argv)
         else:
-            file_copy_async(img.pathname(), img, vm.disk_pathname(), vm)
-        return vm
+            file_copy_async(img['pathname'], diskpath)
+        return VirtualMachine({'name': name, 'owner': owner['name'],
+                               'arch': arch, 'cpus': cpus, 'mem': mem,
+                               'vncpass': None, 'macaddr': None,
+                               'diskpath': diskpath})
 
     @staticmethod
     def create_from_local(name, owner, arch, cpus, mem, pathname):
-        return VirtualMachine(None, name, owner, arch, cpus, mem, None, None, pathname)
+        return VirtualMachine({'name': name, 'owner': owner['name'],
+                               'arch': arch, 'cpus': cpus, 'mem': mem,
+                               'vncpass': None, 'macaddr': None,
+                               'diskpath': pathname})
 
     @staticmethod
     def create_from_upload(name, owner, arch, cpus, mem, filename, data):
@@ -919,31 +845,8 @@ class VirtualMachine(DbObject):
         (root, ext) = os.path.splitext(image_url)
         disk_pathname = VirtualMachine.pathname_for_disk(owner.name(), name, ext)
         vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, None, disk_pathname)
-        file_copy_async(image_url, None, disk_pathname, vm)
+        file_copy_async(image_url, disk_pathname)
         return vm
-
-    @staticmethod
-    def deserialize(args):
-        if not 'disk_pathname' in args:
-            args['disk_pathname'] = "%s/%s.qcow2" % (config['disk.storage.location'], args['name'])
-        return VirtualMachine(args['oid'], args['name'],
-                              user_db.get_by_name(args['owner']),
-                              args['arch'], args['cpus'], args['mem'],
-                              args.get('mac_addr', None),
-                              args.get('vnc_password', None),
-                              args['disk_pathname'])
-    def serialize(self):
-        return {
-                'oid'  : self._oid,
-                'name' : self._name,
-                'owner': self._owner.name(),
-                'arch' : self._arch,
-                'cpus' : self._cpus,
-                'mem'  : self._mem,
-                'mac_addr': self._mac_addr,
-                'vnc_password': self._vnc_password,
-                'disk_pathname' : self._disk_pathname,
-        }
 
     def _qemu_pidfile(self):
         return "%s/%04x/qemu.pid" % (run_dir, self.oid())
@@ -952,7 +855,10 @@ class VirtualMachine(DbObject):
             f = open(self._qemu_pidfile(), 'r')
             buf = f.read()
             f.close()
-            return int(buf.strip())
+            pid = int(buf.strip())
+            if os.path.isdir("/proc/%d" % (pid)):
+                return pid
+            return None
         except BaseException as e:
             return None
     def _get_iso_pathname(self):
@@ -970,8 +876,8 @@ class VirtualMachine(DbObject):
     # Return list of snapshots as (id, tag).  Disk must not be in use.
     def _snapshot_list(self):
         snapshots = []
-        if self._disk_pathname.endswith('.qcow2'):
-            argv = [find_in_path('qemu-img'), 'snapshot', '-l', self._disk_pathname]
+        if self['diskpath'].endswith('.qcow2'):
+            argv = [find_in_path('qemu-img'), 'snapshot', '-l', self['diskpath']]
             (out, err) = cmd_run(argv)
             for line in out.rstrip('\n').split('\n'):
                 fields = line.split()
@@ -988,43 +894,17 @@ class VirtualMachine(DbObject):
                 return True
         return False
 
-    def name(self, val=None):
-        if not val is None:
-            self._name = val
-        return self._name
-    def owner(self):
-        return self._owner
-    def arch(self):
-        return self._arch
-    def cpus(self, val=None):
-        if not val is None:
-            self_cpus = val
-        return self._cpus
-    def mem(self, val=None):
-        if not val is None:
-            self._mem = val
-        return self._mem
-    def disk_pathname(self):
-        return self._disk_pathname
     def disk_physical_size(self):
         try:
-            sb = os.stat(self._disk_pathname)
+            sb = os.stat(self['diskpath'])
             self._disk_psize = (sb.st_blocks * 512) / ONE_MB
         except OSError as e:
             pass
         return self._disk_psize
     def disk_virtual_size(self):
         return self._disk_vsize
-    def copying(self, val=None):
-        if not val is None:
-            self._copy_status = 0 if val else None
-        return (not self._copy_status is None)
-    def copy_pct(self, val=None):
-        if not val is None:
-            self._copy_status = val
-        return self._copy_status if self._copy_status else 100
-    def macaddr(self):
-        return self._mac_addr
+    def copying(self):
+        return self['diskpath'] in file_copy_map
 
     def running(self):
         return not self._pid is None
@@ -1035,44 +915,44 @@ class VirtualMachine(DbObject):
             return 'running'
         return 'stopped'
 
-    def iso_pathname(self):
-        return self._iso_pathname
-    def ipv4addr(self, addr=None):
-        locker = ScopedLocker(self._lock)
-        if not addr is None:
-            self._ipv4addr = addr
-        return self._ipv4addr
+    def ipv4addr(self):
+        print("mac=%s leases=%s" % (self['macaddr'], leases))
+        return leases.get(self['macaddr'], None)
+
+    def ipv6addr(self, val=None):
+        return None
+
     def start(self, **kwargs):
         if self.copying():
             raise RuntimeError("Cannot start while copying")
-        force_readonly = self.disk_pathname().endswith('.vmdk')
+        force_readonly = self['diskpath'].endswith('.vmdk')
         readonly = force_readonly or kwargs.get('readonly', False)
         if force_readonly and not readonly:
             raise RuntimeError("VMDK disks must be read-only")
         resuming = (not readonly) and self._has_snapshot_tag('vmm-suspend')
-        prog = "qemu-system-%s" % (self._arch)
+        prog = "qemu-system-%s" % (self['arch'])
         vm_run_dir = "%s/%04x" % (run_dir, self.oid())
         mkdir_p(vm_run_dir)
         argv = [find_in_path(prog)]
         argv.extend(['-daemonize', '-pidfile', self._qemu_pidfile()])
-        if platform.machine() != 'x86_64' or self._arch != 'x86_64':
+        if platform.machine() != 'x86_64' or self['arch'] != 'x86_64':
             raise RuntimeError("Implement non-x64 support")
         machine_arg = 'pc,accel=kvm'
         cpu_arg = 'host' if config['vm.nesting'] else 'qemu64'
         argv.extend(['-machine', machine_arg, '-cpu', cpu_arg])
-        argv.extend(['-smp', str(self._cpus),
-                '-m', "%dM" % self._mem,
+        argv.extend(['-smp', str(self['cpus']),
+                '-m', "%dM" % self['mem'],
                 '-monitor', "unix:%s/monitor,server,nowait" % (vm_run_dir),
                 '-serial', "unix:%s/serial,server,nowait" % (vm_run_dir),
                 '-vnc', ":%d,password=on" % (self.oid()),
                 '-usb',
                 '-device', 'usb-tablet',
                 '-netdev', "bridge,br=%s,id=net1" % (config['network.bridge.name']),
-                '-device', "e1000,netdev=net1,mac=%s" % (self.macaddr())])
+                '-device', "e1000,netdev=net1,mac=%s" % (self['macaddr'])])
         if readonly:
-            argv.extend(['-drive', "file=%s,snapshot=on" % (self._disk_pathname)])
+            argv.extend(['-drive', "file=%s,snapshot=on" % (self['diskpath'])])
         else:
-            argv.extend(['-drive', "file=%s" % (self._disk_pathname)])
+            argv.extend(['-drive', "file=%s" % (self['diskpath'])])
         if self._iso_pathname:
             # XXX? -drive media=cdrom,file=%s
             argv.extend(['-cdrom', self._iso_pathname, '-boot', 'd'])
@@ -1090,8 +970,8 @@ class VirtualMachine(DbObject):
         print("pid=%d" % (self._pid))
         if resuming:
             self._run_monitor_command('delvm vmm-suspend')
-        if self._vnc_password:
-            self._run_monitor_command("change vnc password %s" % (self._vnc_password))
+        if self['vncpass']:
+            self._run_monitor_command("change vnc password %s" % (self['vncpass']))
 
     def _drain_monitor_socket(self, sock):
         buf = ''
@@ -1115,12 +995,6 @@ class VirtualMachine(DbObject):
             line += '\n'
         sock.send(line.encode())
         return self._drain_monitor_socket(sock)
-
-    def vnc_password(self, val=None):
-        if not val is None:
-            self._vnc_password = val
-            self._run_monitor_command("change vnc password %s" % (self._vnc_password))
-        return self._vnc_password
 
     def iso_pathname(self):
         return self._iso_pathname
@@ -1324,6 +1198,9 @@ def ssl_cli_listener():
 ### HttpClientRequestHandler and http_listener ###
 
 class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
+    # XXX: make global, expire on timer, save/load in run_dir
+    _sessions = {}
+
     def __init__(self, request, client_address, server):
         self._dispatch_table = {
             '/api/v1/user':         self._api_v1_user,
@@ -1434,7 +1311,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r += '   <td width="33%">&nbsp;\n'
         r += "   <td width=\"33%%\" align=\"center\"><img src=\"%s/logo.jpg\" alt=\"logo\">\n" % (config['ui.imagepath'])
         if user:
-            r += "   <td width=\"33%%\" align=\"right\" valign=\"top\">%s<br><a href=\"/ui/logout\">logout</a>\n" % (user.fullname())
+            r += "   <td width=\"33%%\" align=\"right\" valign=\"top\">%s<br><a href=\"/ui/logout\">logout</a>\n" % (user['fullname'])
         else:
             r += '   <td width="33%">&nbsp;\n'
         r += '  <tr>\n'
@@ -1484,10 +1361,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r = ''
         r += '<select name="iso_image">'
         r += '<option value=""></option>'
-        for oid, img in image_db.items():
-            if img.type() != 'iso':
-                continue
-            r += "<option value=\"%d\">%s</option>" % (oid, img.name())
+        for row in iso_images_table.select_all():
+            r += "<option value=\"%d\">%s</option>" % (row['id'], row['name'])
         r += '</select>'
         return r
 
@@ -1495,13 +1370,11 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r = ''
         r += '<select name="disk_image">'
         r += '<option value=""></option>'
-        for oid, img in image_db.items():
-            if img.type() != 'disk':
-                continue
-            if img.oid() == img_id:
-                r += "<option value=\"%d\" selected=\"true\">%s</option>" % (oid, img.name())
+        for row in disk_images_table.select_all():
+            if row['id'] == img_id:
+                r += "<option value=\"%d\" selected=\"true\">%s</option>" % (row['id'], row['name'])
             else:
-                r += "<option value=\"%d\">%s</option>" % (oid, img.name())
+                r += "<option value=\"%d\">%s</option>" % (row['id'], row['name'])
         r += '</select>'
         return r
 
@@ -1509,11 +1382,13 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         msg = None
         if 'username' in args and 'password' in args:
             username = args['username'][0]
-            user = user_db.get_by_name(username)
-            if user:
+            row = users_table.select_by_name(username)
+            if row:
+                user = User(row)
                 password = args['password'][0]
-                if user.auth_password(password):
-                    session = user.create_session()
+                if user.auth_password(args['password'][0]):
+                    session = sha256_string("%s%s%s" % (user['name'], user['pwhash'], time.time()))
+                    self._sessions[session] = user
                     cookie = "session=%s; path=/ui" % session
                     self._send_response(302, {'Set-Cookie': cookie, 'Location': '/ui'}, None)
                     return
@@ -1540,23 +1415,23 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         self._send_response(200, None, r)
 
     def ui_logout(self, user, args):
-        user.remove_session()
         cookie = 'session=none; path=/ui'
         self._send_response(302, {'Set-Cookie': cookie, 'Location': '/ui/login'}, None)
 
     def ui_overview(self, user, args):
         total = { 'cpus': 0, 'mem': 0, 'phys_disk': 0, 'virt_disk': 0 }
         active = { 'cpus': 0, 'mem': 0, 'phys_disk': 0, 'virt_disk': 0 }
-        for oid, vm in vm_db.items():
-            if vm.owner().name() != user.name() and not user.in_group('admin'):
+        for row in vms_table.select_all():
+            if row['owner'] != user['name'] and not user.in_group('admin'):
                 continue
-            total['cpus'] += vm.cpus()
-            total['mem'] += vm.mem()
+            vm = VirtualMachine(row)
+            total['cpus'] += vm['cpus']
+            total['mem'] += vm['mem']
             total['phys_disk'] += vm.disk_physical_size()
             total['virt_disk'] += vm.disk_virtual_size()
             if vm.running():
-                active['cpus'] += vm.cpus()
-                active['mem'] += vm.mem()
+                active['cpus'] += vm['cpus']
+                active['mem'] += vm['mem']
                 active['phys_disk'] += vm.disk_physical_size()
                 active['virt_disk'] += vm.disk_virtual_size()
         r = self._html_head(user)
@@ -1575,11 +1450,16 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         # XXX: auth
         r = self._html_head(user)
         # XXX: handle delete better, like user does
+        img_type = args['type'][0]
         if 'id' in args:
             err = None
             msg = None
             img_id = int(args['id'][0])
-            img = image_db.get_by_oid(img_id)
+            if img_type == 'iso':
+                row = iso_images_table.select_by_oid(img_id)
+            else:
+                row = disk_images_table.select_by_oid(img_id)
+            img = Image(row)
             edit_mode = ('action' in args) and (args['action'][0] == 'Edit')
             if 'action' in args:
                 if args['action'][0] == 'Save':
@@ -1589,16 +1469,20 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     image_db.save()
                     msg = 'Settings saved'
                 if args['action'][0] == 'Delete':
-                    image_db.remove(img)
+                    if img_type == 'iso':
+                        iso_images_table.delete(img)
+                    else:
+                        disk_images_table.delete(img)
                     path = "/ui/image?type=%s" % (img.type())
                     self._send_response(302, {'Location': path}, None)
                     return
-            r += "  <p style=\"font-size:150%%\">%s</p>\n" % (img.name())
+            r += "  <p style=\"font-size:150%%\">%s</p>\n" % (img['name'])
             if msg:
                 r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
             if err:
                 r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (errmsg)
             r += '  <form method="POST" action="/ui/image">\n'
+            r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (img_type)
             r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (img_id)
             r += '   <table>\n'
             if edit_mode:
@@ -1607,7 +1491,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 r += "    <tr><td style=\"font-weight:bold\">Visibility<td><input type=\"checkbox\" name=\"public\" %s>Public\n" % (val)
                 r += '    <tr><td><input type="submit" name="action" value="Save"><td>&nbsp;\n'
             else:
-                val = 'Public' if img.public() else 'Private'
+                val = 'Public' if img['public'] else 'Private'
                 r += "    <tr><td style=\"font-weight:bold\">Visibility<td>%s\n" % (val)
                 r += '    <tr><td><input type="submit" name="action" value="Edit"><td>&nbsp;\n'
             r += "    <tr><td style=\"font-weight:bold\">Virtual Size<td>%s\n" % (readable_size(img.virtual_size(), ONE_MB))
@@ -1617,10 +1501,9 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '   </table>\n'
             r += '  </form>\n'
         else:
-            imgtype = args['type'][0] if 'type' in args else 'Unknown'
-            r += "  <p style=\"font-size:150%%\">%s Images</p>\n" % (imgtype)
+            r += "  <p style=\"font-size:150%%\">%s Images</p>\n" % (img_type)
             r += '  <form method="GET" action="/ui/image/create">\n'
-            r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (imgtype)
+            r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (img_type)
             r += '   <table width="100%">\n'
             r += '    <tr>\n'
             r += '     <td><input type="submit" value="Create">\n'
@@ -1629,20 +1512,23 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '  <table width="100%">\n'
             r += '   <tr style="font-weight:bold"><td>Name<td>Owner<td>Visibility<td>&nbsp;</tr>\n'
             idx = -1
-            for oid, img in image_db.items():
+            if img_type == 'iso':
+                cursor = iso_images_table.select_all()
+            else:
+                cursor = disk_images_table.select_all()
+            for row in cursor:
+                img = Image(row)
                 bgcolor = '#e0e0e0' if (idx % 2) == 0 else 'initial'
-                if img.type() != imgtype:
-                    continue
-                if img.owner().name() != user.name() and not img.public() and not user.in_group('admin'):
+                if img['owner'] != user['name'] and not img['public'] and not user.in_group('admin'):
                     continue
                 idx += 1
                 r += "   <tr style=\"background-color:%s\">" % (bgcolor)
-                r += "<td><a href=\"/ui/image?id=%d\">%s</a>" % (img.oid(), img.name())
-                r += "<td>%s" % (img.owner().name())
-                r += "<td>%s" % ('Public' if  img.public() else 'Private')
+                r += "<td><a href=\"/ui/image?type=%s&id=%d\">%s</a>" % (img_type, img['id'], img['name'])
+                r += "<td>%s" % (img['owner'])
+                r += "<td>%s" % ('Public' if  img['public'] else 'Private')
                 if not img.copying():
                     if img.type() == 'disk':
-                        r += "<td><a href=\"/ui/vm/create?img_id=%d\">Launch</a>" % (img.oid())
+                        r += "<td><a href=\"/ui/vm/create?img_id=%d\">Launch</a>" % (img['id'])
                     else:
                         r += "<td>&nbsp;"
                 else:
@@ -1656,6 +1542,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r = self._html_head(user)
         msg = None
         err = None
+        img_type = args['type'][0]
         if 'action' in args and args['action'][0] == 'Create':
             img = None
             name = args['name'][0]
@@ -1674,8 +1561,11 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 url = args['remote_url'][0]
                 img = Image.create_from_url(name, url, user, public)
             if img:
-                image_db.insert(img)
-                self._send_response(302, {'Location': "/ui/image?id=%d" % (img.oid())}, None)
+                if img_type == 'iso':
+                    iso_images_table.insert(img)
+                else:
+                    disk_images_table.insert(img)
+                self._send_response(302, {'Location': "/ui/image?type=%s&id=%d" % (img_type, img.oid())}, None)
 
         r += '  <p style="font-size:150%">Create Image</p>\n'
         if msg:
@@ -1700,6 +1590,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r += '   }\n'
         r += '  </script>\n'
         r += '  <form method="POST" action="/ui/image/create" enctype="multipart/form-data">\n'
+        r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (img_type)
         r += '   <table>\n'
         r += '    <tr><td style="font-weight:bold">Name<td><input type="text" name="name">\n'
         r += '    <tr><td style="font-weight:bold">Image Source<td><select name="image_source" onChange="imageSourceSelected(this);">'
@@ -1728,7 +1619,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 r += self._html_foot(user)
                 self._send_response(403, None, r)
                 return
-            user = user_db.get_by_oid(args_id)
+            row = users_table.select_by_oid(args_id)
+            user = User(row)
         msg = None
         err = None
         token = None
@@ -1770,11 +1662,11 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 msg = 'User deleted'
                 args_id = None
             if args['action'][0] == 'Generate':
-                token = sha256_string("%s%s%s" % (user.name(), user.pwhash(), time.time()))
-                user.token(token)
+                token = sha256_string("%s%s%s" % (user['name'], user['pwhash'], time.time()))
+                user['token'] = token
                 changed = True
             if changed:
-                user_db.save()
+                users_table.update(user)
                 msg = 'Settings saved'
         r += '  <p style="font-size:150%">Settings</p>\n'
         if msg:
@@ -1791,10 +1683,11 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '  </form>\n'
             r += '  <table width="100%">\n'
             r += '   <tr><td>Name<td>Full name<td>&nbsp;\n'
-            for oid, obj in user_db.items():
-                r += "   <tr><td><a href=\"/ui/user?id=%d\">%s</a><td>%s" % (oid, obj.name(), obj.fullname())
+            for row in users_table.select_all():
+                u = User(row)
+                r += "   <tr><td><a href=\"/ui/user?id=%d\">%s</a><td>%s" % (u.oid(), u['name'], u['fullname'])
                 r += '<td><form method="POST" action="/ui/user">'
-                r += "<input type=\"hidden\" name=\"id\" value=\"%d\">" % (oid)
+                r += "<input type=\"hidden\" name=\"id\" value=\"%d\">" % (u.oid())
                 r += '<input type="submit" name="action" value="Delete">\n'
                 r += '</form>\n'
             r += '  </table>\n'
@@ -1803,7 +1696,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += "   <input type=\"hidden\" name=\"id\" value=%d>\n" % (user.oid())
             r += '   <table width="100%">\n'
             r += '    <tr><td style="font-size:80%;font-weight:bold">Full name<td>&nbsp;\n'
-            r += "    <tr><td><input type=\"text\" name=\"fullname\" value=\"%s\"><td>&nbsp;\n" % (user.fullname())
+            r += "    <tr><td><input type=\"text\" name=\"fullname\" value=\"%s\"><td>&nbsp;\n" % (user['fullname'])
             r += '    <tr><td colspan="2">&nbsp;\n'
             r += '    <tr><td style="font-size:80%;font-weight:bold">Password<td>&nbsp\n'
             r += '    <tr><td><input type="password" name="oldpass">&nbsp;[old]<td>&nbsp;\n'
@@ -1811,10 +1704,10 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '    <tr><td><input type="password" name="newpass2">&nbsp;[confirm]<td>&nbsp;\n'
             r += '    <tr><td colspan="2">&nbsp;\n'
             r += '    <tr><td style="font-size:80%;font-weight:bold">Email<td>&nbsp\n'
-            r += "    <tr><td><input type=\"text\" name=\"email\" value=\"%s\"><td>&nbsp;\n" % (user.email())
+            r += "    <tr><td><input type=\"text\" name=\"email\" value=\"%s\"><td>&nbsp;\n" % (user['email'])
             if is_admin:
                 r += '    <tr><td style="font-size:80%;font-weight:bold">Local UID<td>&nbsp\n'
-                r += "    <tr><td><input type=\"number\" name=\"localuid\" value=\"%s\"<td>&nbsp;\n" % (user.localuid())
+                r += "    <tr><td><input type=\"number\" name=\"localuid\" value=\"%s\"<td>&nbsp;\n" % (user['localuid'])
             r += '    <tr><td colspan="2">&nbsp;\n'
 #            r += '    <tr><td style="font-size:80%;font-weight:bold">Time zone<td>&nbsp;\n'
 #            r += "    <tr><td><input type=\"text\" name=\"timezone\" value=\"%s\"><td>&nbsp;\n" % (user.timezone())
@@ -1841,7 +1734,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             fullname = args['fullname'][0]
             password = args['password'][0]
             user = User.create(name, fullname, password, [])
-            user_db.insert(user)
+            users_table.insert(user)
             msg = 'User created'
 
         r += '  <p style="font-size:150%">Add user</p>\n'
@@ -1874,7 +1767,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             if ':' in server_host:
                 server_host = server_host.split(':')[0]
             vm_id = int(args['id'][0])
-            vm = vm_db.get_by_oid(vm_id)
+            row = vms_table.select_by_oid(vm_id)
+            vm = VirtualMachine(row)
             edit_mode = (not vm.running()) and ('action' in args) and (args['action'][0] == 'Edit')
             if 'action' in args:
                 if args['action'][0] == 'Save':
@@ -1907,8 +1801,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     vm.iso_eject()
                 if args['action'][0] == 'Delete':
                     if not vm.running():
-                        file_delete(vm.disk_pathname())
-                        vm_db.remove(vm)
+                        file_delete(vm['diskpath'])
+                        vms_table.delete(vm)
                         self._send_response(302, {'Location': '/ui/vm'}, None)
                     else:
                         err = 'Cannot delete: machine is running'
@@ -1917,7 +1811,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     public = args['image_public'][0]
                     img = Image.create_from_vmdisk(name, vm, user, public)
                     image_db.insert(img)
-            r += "  <p style=\"font-size:150%%\">%s</p>\n" % (vm.name())
+            r += "  <p style=\"font-size:150%%\">%s</p>\n" % (vm['name'])
             if msg:
                 r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
             if err:
@@ -1927,23 +1821,23 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '   <table>\n'
             #XXX r += "    <tr><td style=\"font-weight:bold\">Arch<td>%s\n" % (vm.arch())
             if edit_mode:
-                r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (vm.name())
-                r += "    <tr><td style=\"font-weight:bold\">CPUs<td><input type=\"number\" name=\"cpus\" value=\"%d\" size=\"6\">\n" % (vm.cpus())
-                r += "    <tr><td style=\"font-weight:bold\">Mem<td><input type=\"text\" name=\"mem\" value=\"%s\" size=\"6\">\n" % (readable_size(vm.mem(), ONE_MB))
+                r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (vm['name'])
+                r += "    <tr><td style=\"font-weight:bold\">CPUs<td><input type=\"number\" name=\"cpus\" value=\"%d\" size=\"6\">\n" % (vm['cpus'])
+                r += "    <tr><td style=\"font-weight:bold\">Mem<td><input type=\"text\" name=\"mem\" value=\"%s\" size=\"6\">\n" % (readable_size(vm['mem'], ONE_MB))
                 r += '    <tr><td><input type="submit" name="action" value="Save"><td>&nbsp;\n'
             else:
-                r += "    <tr><td style=\"font-weight:bold\">CPUs<td>%d\n" % (vm.cpus())
-                r += "    <tr><td style=\"font-weight:bold\">Mem<td>%s\n" % (readable_size(vm.mem(), ONE_MB))
+                r += "    <tr><td style=\"font-weight:bold\">CPUs<td>%d\n" % (vm['cpus'])
+                r += "    <tr><td style=\"font-weight:bold\">Mem<td>%s\n" % (readable_size(vm['mem'], ONE_MB))
                 if not vm.running():
                     r += '    <tr><td><input type="submit" name="action" value="Edit"><td>&nbsp;\n'
             r += "    <tr><td style=\"font-weight:bold\">Disk<td>%s\n" % (readable_size(vm.disk_virtual_size(), ONE_MB))
             r += "    <tr><td style=\"font-weight:bold\">State<td>%s\n" % (vm.state())
-            r += "    <tr><td style=\"font-weight:bold\">MAC<td>%s\n" % (vm.macaddr())
+            r += "    <tr><td style=\"font-weight:bold\">MAC<td>%s\n" % (vm['macaddr'])
             r += "    <tr><td style=\"font-weight:bold\">Addr<td>%s\n" % (vm.ipv4addr())
             r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             if vm.running():
                 r += "    <tr><td style=\"font-weight:bold\">VNC Host<td>%s:%d\n" % (server_host, vm_id)
-                r += "    <tr><td style=\"font-weight:bold\">VNC Pass<td>%s\n" % (vm.vnc_password())
+                r += "    <tr><td style=\"font-weight:bold\">VNC Pass<td>%s\n" % (vm['vncpass'])
                 r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             r += '   </table>\n'
             r += '   <table>\n'
@@ -1963,10 +1857,11 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 r += '    <tr><td colspan="2"><input type="submit" name="action" value="Power Off">\n'
                 r += '    <tr><td colspan="2"><input type="submit" name="action" value="Kill">\n'
             elif vm.copying():
-                r += "    <tr><td style=\"font-weight:bold\">Copying<td>%d%%\n" % (vm.copy_pct())
+                r += '    <tr><td style="font-weight:bold">Copying<td>&nbsp;\n'
             else:
                 r += '    <tr><td colspan="2"><input type="submit" name="action" value="Start">'
-                if vm.disk_pathname().endswith('.vmdk'):
+                # XXX: vm.disktype()
+                if vm['diskpath'].endswith('.vmdk'):
                     r += '<input type="checkbox" name="readonly" disabled checked>Read only mode\n'
                 else:
                     r += '<input type="checkbox" name="readonly">Read only mode\n'
@@ -1990,16 +1885,20 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '  <table with="100%">\n'
             r += '   <tr style="font-weight:bold"><td>Name<td>State<td>Address</tr>\n'
             idx = -1
-            for oid, vm in vm_db.items():
+            if user.in_group('admin'):
+                cursor = vms_table.select_all()
+            else:
+                cursor = vms_table.select_where("owner=\"%s\"" % (user['name']))
+            for row in cursor:
+                vm = VirtualMachine(row)
                 idx += 1
                 bgcolor = '#e0e0e0' if (idx % 2) == 0 else 'initial'
-                if vm.owner().name() != user.name() and not user.in_group('admin'):
-                    continue
                 addr = '&nbsp;'
+                # XXX: use vm_running for this
                 if vm.running():
                     addr = vm.ipv4addr()
                 r += "   <tr style=\"background-color:%s\">" % (bgcolor)
-                r += "<td><a href=\"/ui/vm?id=%d\">%s</a>" % (vm.oid(), vm.name())
+                r += "<td><a href=\"/ui/vm?id=%d\">%s</a>" % (vm.oid(), vm['name'])
                 r += "<td>%s" % (vm.state())
                 r += "<td>%s" % (addr)
                 # XXX: create-time (age), on-time (uptime)
@@ -2049,7 +1948,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             if args['disk_source'][0] == 'remote_url':
                 image_url = args['remote_url'][0]
                 vm = VirtualMachine.create_from_url(name, user, arch, cpus, mem, image_url)
-            vm_db.insert(vm)
+            vms_table.insert(vm)
             self._send_response(302, {'Location': "/ui/vm?id=%d" % (vm.oid())}, None)
 
         img_id = int(args['img_id'][0]) if 'img_id' in args else None
@@ -2152,15 +2051,13 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 fields = self.headers['Authorization'].split()
                 if len(fields) == 2 and fields[0] == 'Bearer':
                     token = fields[1]
-                    for oid, obj in user_db.items():
-                        if obj.token() == token:
-                            user = obj
-                            break
+                    row = user_table.select_one("token='%s'" % (token))
+                    user = User(row)
             if 'Cookie' in self.headers:
                 for kvp in self.headers['Cookie'].split(';'):
                     (k, v) = kvp.strip().split('=', 1)
                     if k == 'session':
-                        user = User.get_from_session(v)
+                        user = self._sessions.get(v, None)
             if not user and path != '/ui/login':
                 self._send_response(302, {'Location': '/ui/login'}, None)
                 return
@@ -2216,14 +2113,12 @@ def ssl_http_listener():
 
 file_copy_lock = threading.Lock()
 file_copy_queue = []
+file_copy_map = {}
 
-def file_copy_async(src_loc, src_obj, dst_loc, dst_obj):
-    if src_obj:
-        src_obj.copying(True)
-    if dst_obj:
-        dst_obj.copying(True)
+def file_copy_async(src, dst):
     file_copy_lock.acquire()
-    file_copy_queue.append((src_loc, src_obj, dst_loc, dst_obj))
+    file_copy_queue.append(dst)
+    file_copy_map[dst] = src
     file_copy_lock.release()
 
 def file_copy_simple(srcfile, dstfile, file_size, watcher):
@@ -2262,64 +2157,49 @@ def file_copier():
             item = None
             file_copy_lock.acquire()
             if file_copy_queue:
-                item = file_copy_queue.pop(0)
+                dst = file_copy_queue.pop(0)
+                src = file_copy_map[dst]
             file_copy_lock.release()
             if item:
-                (src_loc, src_obj, dst_loc, dst_obj) = item
-                if src_loc.startswith('/'):
-                    srcfile = open(src_loc, 'rb')
-                    dstfile = open(dst_loc, 'wb')
-                    size = os.stat(src_loc).st_size
-                    file_copy_sparse(srcfile, dstfile, size, dst_obj)
+                if src.startswith('/'):
+                    srcfile = open(src, 'rb')
+                    dstfile = open(dst, 'wb')
+                    size = os.stat(src).st_size
+                    file_copy_sparse(srcfile, dstfile, size, None)
                 else:
-                    srcfile = urllib.request.urlopen(src_loc)
-                    dstfile = open(dst_loc, 'wb')
+                    srcfile = urllib.request.urlopen(src)
+                    dstfile = open(dst, 'wb')
                     size = int(srcfile.headers.get('Content-Length', '0'))
-                    file_copy_simple(srcfile, dstfile, size, dst_obj)
-                if dst_obj:
-                    dst_obj.copying(False)
-                if src_obj:
-                    src_obj.copying(False)
+                    file_copy_simple(srcfile, dstfile, size, None)
+                file_copy_lock.acquire()
+                del file_copy_map[dst]
+                file_copy_lock.release()
         except BaseException as e:
             loge("Exception in file_copy thread: %s" % (e))
-        time.sleep(1)
-
-### Virtual machine reaper ###
-
-def vm_reaper():
-    while True:
-        try:
-            for oid, vm in vm_db.items():
-                if vm.running():
-                    proc_dir = "/proc/%d" % (vm.pid())
-                    if not os.path.isdir(proc_dir):
-                        vm.notify_stopped()
-        except BaseException as e:
-            loge("Exception in vm_reaper thread: %s" % (e))
         time.sleep(1)
 
 ### Lease updater ###
 
 def lease_updater():
+    global leases
     leases_pathname = "%s/dnsmasq.leases" % (state_dir)
     last_mtime = 0
     while True:
         try:
             cur_mtime = os.stat(leases_pathname)
             if cur_mtime != last_mtime:
+                new_leases = {}
                 last_mtime = cur_mtime
                 f = open(leases_pathname, 'r')
                 for line in f:
                     fields = line.split()
-                    vm_mac = fields[1]
-                    vm_ip = fields[2]
-                    vm_name = fields[3]
-                    # XXX: Create VM dict indexed by MAC addr
-                    for oid, vm in vm_db.items():
-                        if vm.macaddr() == vm_mac:
-                            if vm.ipv4addr() != vm_ip:
-                                vm.ipv4addr(vm_ip)
+                    macaddr = fields[1]
+                    ipv4addr = fields[2]
+                    name = fields[3]
+                    new_leases[macaddr] = ipv4addr
                 f.close()
+                leases = new_leases
+                print("leases=%s" % (leases))
         except OSError as e:
             last_mtime = 0
         except BaseException as e:
@@ -2338,7 +2218,7 @@ config_defaults = {
     'image.storage.location': '/var/lib/vmm/images',
 
     'disk.storage.type': 'dir',
-    'disk.storage.location': '/var/lib/vmm/disk',
+    'disk.storage.location': '/var/lib/vmm/disks',
     'disk.storage.name': '%u.%n',
 
     'network.mode': 'manual',
@@ -2379,31 +2259,73 @@ mkdir_p(config['iso.storage.location'])
 mkdir_p(config['image.storage.location'])
 mkdir_p(config['disk.storage.location'])
 
-# Initialize databases
-user_db = NamedObjectDatabase(User, "%s/user.db" % (state_dir))
-if user_db.empty():
-    root = User.create('root', 'Root User', 'root', ['admin'])
-    user_db.insert(root)
+# Initialize database
+dbfile = "%s/vmm.sqlite" % (state_dir)
+dbconn = sqlite3.connect(dbfile, check_same_thread=False)
+os.chmod(dbfile, 0o0600)
+dbconn.isolation_level = None
+dbconn.row_factory = sqlite3.Row
+users_table = DbTable(dbconn, 'users',
+"""id          INTEGER PRIMARY KEY,
+   name        VARCHAR(64),
+   fullname    VARCHAR(64),
+   pwhash      CHAR(64),
+   groups      VARCHAR(256),
+   localuid    INTEGER,
+   email       VARCHAR(256),
+   timezone    INTEGER,
+   token       CHAR(64)""")
+
+iso_images_table = DbTable(dbconn, 'iso_images',
+"""id          INTEGER PRIMARY KEY,
+   owner       VARCHAR(64),
+   name        VARCHAR(256),
+   pathname    VARCHAR(256),
+   public      INTEGER""")
+
+disk_images_table = DbTable(dbconn, 'disk_images',
+"""id          INTEGER PRIMARY KEY,
+   owner       VARCHAR(64),
+   name        VARCHAR(256),
+   pathname    VARCHAR(256),
+   public      INTEGER""")
+
+vms_table = DbTable(dbconn, 'vms',
+"""id          INTEGER PRIMARY KEY,
+   owner       VARCHAR(64),
+   name        VARCHAR(256),
+   arch        VARCHAR(64),
+   cpus        INTEGER,
+   mem         INTEGER,
+   vncpass     CHAR(8),
+   macaddr     CHAR(17),
+   disksize    INTEGER,
+   diskpath    VARCHAR(256)""")
+
+if users_table.empty():
+    root = User.create('root', 'Root User', 'root', 'admin')
+    users_table.insert(root)
 else:
-    root = user_db.get_by_name('root')
-image_db = NamedObjectDatabase(Image, "%s/image.db" % (state_dir))
-if image_db.empty():
+    root = users_table.select_by_name('root')
+if iso_images_table.empty():
     for filename in os.listdir(config['iso.storage.location']):
         pathname = "%s/%s" % (config['iso.storage.location'], filename)
         (name, ext) = os.path.splitext(filename)
         if not ext in ['.iso']:
             continue
-        img = Image(None, name, pathname, root, True)
-        image_db.insert(img)
+        img = Image.create_from_local(name, pathname, root, 1)
+        iso_images_table.insert(img)
+# XXX: else check removed
+if disk_images_table.empty():
     for filename in os.listdir(config['image.storage.location']):
         pathname = "%s/%s" % (config['image.storage.location'], filename)
         (name, ext) = os.path.splitext(filename)
         if not ext in ['.vmdk', '.qcow2']:
             continue
-        img = Image(None, name, pathname, root, True)
-        image_db.insert(img)
-vm_db = NamedObjectDatabase(VirtualMachine, "%s/vm.db" % (state_dir))
-if vm_db.empty():
+        img = Image.create_from_local(name, pathname, root, 1)
+        disk_images_table.insert(img)
+# XXX: else check removed
+if vms_table.empty():
     # XXX: handle LVM
     for filename in os.listdir(config['disk.storage.location']):
         pathname = "%s/%s" % (config['disk.storage.location'], filename)
@@ -2412,34 +2334,9 @@ if vm_db.empty():
             continue
         if not fields[2] in ['qcow2', 'vmdk']:
             continue
-        vm = VirtualMachine(None, fields[0], fields[1], platform.machine(), '2', '4096', pathname)
-        vm_db.insert(vm)
-
-if False: # XXX: We cannot import disks, they must be associated with VMs
-    if config['disk.storage.type'] == 'dir':
-        mkdir_p(config['disk.storage.location'])
-        for filename in os.listdir(config['disk.storage.location']):
-            # XXX: vmdk also
-            if not filename.endswith('.qcow2'):
-                continue
-            name = filename[:-6]
-            pathname = "%s/%s" % (config['disk.storage.location'], filename)
-            disk = Disk(None, name, pathname, root, True)
-            disk_db.insert(disk)
-    if config['disk.storage.type'] == 'lvm':
-        vg_path = "/dev/%s" % (config['disk.storage.location'])
-        for name in os.listdir(vg_path):
-            pathname = "%s/%s" % (vg_path, filename)
-            disk = Disk(None, name, pathname, root)
-            disk_db.insert(img)
-else:
-    removed = []
-    for oid, img in image_db.items():
-        if not os.path.exists(img.pathname()):
-            logi("Image %s at %s disappeared" % (img.name(), img.pathname()))
-            removed.append(img)
-    for img in removed:
-        image_db.remove(img)
+        vm = VirtualMachine.create_from_local(fields[1], fields[0], 'x86_64', 2, 4096, pathname)
+        vms_table.insert(vm)
+# XXX: else check removed
 
 # Setup networking
 
@@ -2496,6 +2393,15 @@ else:
     sys.stderr.write("FIXME: implement non-bridge networking\n")
     sys.exit(1)
 
+for entry in os.listdir(run_dir):
+    path = "%s/%s" % (run_dir, entry)
+    if not os.path.isdir(entry):
+        continue
+    id = int(entry, 16)
+    row = vms_table.select_by_id(id)
+    vm = VirtualMachine(row)
+    vms_running.append(vm)
+
 # XXX: If not debug/foreground, daemonize
 
 # XXX: Probably don't need this anymore
@@ -2504,10 +2410,6 @@ signal.signal(signal.SIGCHLD, sig_child)
 file_copier_thread = threading.Thread(target=file_copier)
 file_copier_thread.daemon = True
 file_copier_thread.start()
-
-vm_reaper_thread = threading.Thread(target=vm_reaper)
-vm_reaper_thread.daemon = True
-vm_reaper_thread.start()
 
 lease_updater_thread = threading.Thread(target=lease_updater)
 lease_updater_thread.daemon = True

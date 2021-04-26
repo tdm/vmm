@@ -7,7 +7,6 @@ Need to do
  - Add download/copy pct to image detail
  - Track references to images and isos
  - Add ability to modify user groups
- - Use sqlite
  - Finish API implementation
  - Security checks for all operations
 
