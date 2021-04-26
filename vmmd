@@ -752,8 +752,11 @@ class Image(DbObject):
     def fmt(self):
         return self._fmt
     def physical_size(self):
-        sb = os.stat(self['pathname'])
-        self._physical_size = (sb.st_blocks * 512) / ONE_MB
+        try:
+            sb = os.stat(self['pathname'])
+            self._physical_size = (sb.st_blocks * 512) / ONE_MB
+        except OSError as e:
+            pass
         return self._physical_size
     def virtual_size(self):
         return self._virtual_size
@@ -894,6 +897,8 @@ class VirtualMachine(DbObject):
                 return True
         return False
 
+    def disk_exists(self):
+        return not self._disk_vsize is None
     def disk_physical_size(self):
         try:
             sb = os.stat(self['diskpath'])
@@ -923,6 +928,8 @@ class VirtualMachine(DbObject):
         return None
 
     def start(self, **kwargs):
+        if not self.disk_exists():
+            raise RuntimeError("Cannot start without disk")
         if self.copying():
             raise RuntimeError("Cannot start while copying")
         force_readonly = self['diskpath'].endswith('.vmdk')
@@ -1427,13 +1434,15 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             vm = VirtualMachine(row)
             total['cpus'] += vm['cpus']
             total['mem'] += vm['mem']
-            total['phys_disk'] += vm.disk_physical_size()
-            total['virt_disk'] += vm.disk_virtual_size()
+            if vm.disk_exists():
+                total['phys_disk'] += vm.disk_physical_size()
+                total['virt_disk'] += vm.disk_virtual_size()
             if vm.running():
                 active['cpus'] += vm['cpus']
                 active['mem'] += vm['mem']
-                active['phys_disk'] += vm.disk_physical_size()
-                active['virt_disk'] += vm.disk_virtual_size()
+                if vm.disk_exists():
+                    active['phys_disk'] += vm.disk_physical_size()
+                    active['virt_disk'] += vm.disk_virtual_size()
         r = self._html_head(user)
         r += '  <p style="font-size:150%">Overview</p>\n'
         r += '  <table width="100%">\n'
@@ -2154,13 +2163,13 @@ def file_copy_sparse(srcfile, dstfile, file_size, watcher):
 def file_copier():
     while True:
         try:
-            item = None
+            src = None
             file_copy_lock.acquire()
             if file_copy_queue:
                 dst = file_copy_queue.pop(0)
                 src = file_copy_map[dst]
             file_copy_lock.release()
-            if item:
+            if src:
                 if src.startswith('/'):
                     srcfile = open(src, 'rb')
                     dstfile = open(dst, 'wb')
