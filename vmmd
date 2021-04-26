@@ -212,8 +212,8 @@ def readable_size(val, scale=1):
     else:
         d = (1 << 40)
         m = 'TB'
-    i = (n / d)
-    f = (n - (i * d)) / (d / 100)
+    i = int(n / d)
+    f = int((n - (i * d)) / (d / 100))
     return "%d.%02d %s" % (i, f, m)
 
 def readable_time(val):
