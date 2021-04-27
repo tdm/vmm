@@ -723,6 +723,8 @@ class Image(DbObject):
             pathname = "%s/%s" % (config['iso.storage.location'], filename)
         else:
             pathname = "%s/%s" % (config['image.storage.location'], filename)
+        if os.path.exists(pathname):
+            raise RuntimeError("Image already exists")
         f = open(pathname, 'wb')
         f.write(data)
         f.close()
@@ -734,6 +736,8 @@ class Image(DbObject):
             pathname = "%s/%s" % (config['iso.storage.location'], os.path.basename(url))
         else:
             pathname = "%s/%s" % (config['image.storage.location'], os.path.basename(url))
+        if os.path.exists(pathname):
+            raise RuntimeError("Image already exists")
         img = Image({'name': name, 'pathname': pathname, 'owner': user['name'], 'public': public})
         print("Image: add %s to fetch queue" % (url))
         acp_queue(url, pathname)
@@ -743,6 +747,8 @@ class Image(DbObject):
     def create_from_vmdisk(name, vm, user, public):
         filename = os.path.basename(vm.disk_pathname())
         pathname = "%s/%s" % (config['image.storage.location'], filename)
+        if os.path.exists(pathname):
+            raise RuntimeError("Image already exists")
         img = Image({'name': name, 'pathname': pathname, 'owner': user['name'], 'public': public})
         acp_queue(vm.disk_pathname(), img.pathname())
         return img
@@ -800,6 +806,8 @@ class VirtualMachine(DbObject):
     def create_new(name, owner, arch, cpus, mem, disk_size):
         # XXX: deal with LVM
         diskpath = VirtualMachine.pathname_for_disk(owner['name'], name, '.qcow2')
+        if os.path.exists(diskpath):
+            raise RuntimeError("Disk already exists")
         argv = [find_in_path('qemu-img'), 'create',
                 '-f', 'qcow2',
                 '-o', 'preallocation=metadata',
@@ -815,6 +823,8 @@ class VirtualMachine(DbObject):
         img = disk_images_table.select_by_oid(image_oid)
         (root, ext) = os.path.splitext(img['pathname'])
         diskpath = VirtualMachine.pathname_for_disk(owner['name'], name, ext)
+        if os.path.exists(diskpath):
+            raise RuntimeError("Disk already exists")
         if ext == '.qcow2':
             argv = [find_in_path('qemu-img'), 'create', '-f', 'qcow2', '-b', img['pathname'], diskpath]
             cmd_run(argv)
@@ -834,19 +844,23 @@ class VirtualMachine(DbObject):
 
     @staticmethod
     def create_from_upload(name, owner, arch, cpus, mem, filename, data):
-        pathname = "%s/%s" % (config['disk.storage.location'], filename)
-        f = open(pathname, 'wb')
+        diskpath = "%s/%s" % (config['disk.storage.location'], filename)
+        if os.path.exists(diskpath):
+            raise RuntimeError("Disk already exists")
+        f = open(diskpath, 'wb')
         f.write(data)
         f.close()
-        return VirtualMachine.create_from_local(name, owner, arch, cpus, mem, pathname)
+        return VirtualMachine.create_from_local(name, owner, arch, cpus, mem, diskpath)
 
     @staticmethod
     def create_from_url(name, owner, arch, cpus, mem, image_url):
         # XXX: deal with LVM
         (root, ext) = os.path.splitext(image_url)
-        disk_pathname = VirtualMachine.pathname_for_disk(owner.name(), name, ext)
-        vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, None, disk_pathname)
-        acp_queue(image_url, disk_pathname)
+        diskpath = VirtualMachine.pathname_for_disk(owner.name(), name, ext)
+        if os.path.exists(diskpath):
+            raise RuntimeError("Disk already exists")
+        vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, None, diskpath)
+        acp_queue(image_url, diskpath)
         return vm
 
     def _qemu_pidfile(self):
@@ -1561,19 +1575,23 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             img = None
             name = args['name'][0]
             public = args['public'][0] if 'public' in args else False
-            if args['image_source'][0] == 'upload_file':
-                filename = args['upload_file.filename'][0]
-                data = args['upload_file'][0]
-                img = Image.create_from_upload(name, filename, data, user, public)
-            if args['image_source'][0] == 'server_file':
-                pathname = args['server_file'][0]
-                if user.may_access_file(pathname):
-                    img = Image.create_from_local(name, pathname, user, public)
-                else:
-                    err = 'Permission denied'
-            if args['image_source'][0] == 'remote_url':
-                url = args['remote_url'][0]
-                img = Image.create_from_url(name, url, user, public)
+            try:
+                if args['image_source'][0] == 'upload_file':
+                    filename = args['upload_file.filename'][0]
+                    data = args['upload_file'][0]
+                    img = Image.create_from_upload(name, filename, data, user, public)
+                if args['image_source'][0] == 'server_file':
+                    pathname = args['server_file'][0]
+                    if user.may_access_file(pathname):
+                        img = Image.create_from_local(name, pathname, user, public)
+                    else:
+                        err = 'Permission denied'
+                if args['image_source'][0] == 'remote_url':
+                    url = args['remote_url'][0]
+                    img = Image.create_from_url(name, url, user, public)
+            except BaseException as e:
+                err = str(e)
+                img = None
             if img:
                 if img_type == 'iso':
                     iso_images_table.insert(img)
@@ -1940,31 +1958,36 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 mem /= ONE_MB
             if mem < 1 or mem > 16*1024:
                 err = 'Invalid mem'
-            if args['disk_source'][0] == 'create_new':
-                disk_size = parse_num(args['disk_size'][0])
-                if disk_size >= ONE_MB:
-                    disk_size /= ONE_MB
-                if disk_size < 1 or disk_size > 256*1024:
-                    err = 'Invalid disk size'
-                vm = VirtualMachine.create_new(name, user, arch, cpus, mem, disk_size)
-            if args['disk_source'][0] == 'use_image':
-                image_oid = int(args['disk_image'][0])
-                vm = VirtualMachine.create_from_image(name, user, arch, cpus, mem, image_oid)
-            if args['disk_source'][0] == 'upload_file':
-                filename = args['upload_file.filename'][0]
-                data = args['upload_file'][0]
-                vm = VirtualMachine.create_from_upload(name, user, arch, cpus, mem, filename, data)
-            if args['disk_source'][0] == 'server_file':
-                pathname = args['server_file'][0]
-                if user.may_access_file(pathname):
-                    vm = VirtualMachine.create_from_local(name, user, arch, cpus, mem. pathname)
-                else:
-                    err = 'Permission denied'
-            if args['disk_source'][0] == 'remote_url':
-                image_url = args['remote_url'][0]
-                vm = VirtualMachine.create_from_url(name, user, arch, cpus, mem, image_url)
-            vms_table.insert(vm)
-            self._send_response(302, {'Location': "/ui/vm?id=%d" % (vm.oid())}, None)
+            try:
+                if args['disk_source'][0] == 'create_new':
+                    disk_size = parse_num(args['disk_size'][0])
+                    if disk_size >= ONE_MB:
+                        disk_size /= ONE_MB
+                    if disk_size < 1 or disk_size > 256*1024:
+                        err = 'Invalid disk size'
+                    vm = VirtualMachine.create_new(name, user, arch, cpus, mem, disk_size)
+                if args['disk_source'][0] == 'use_image':
+                    image_oid = int(args['disk_image'][0])
+                    vm = VirtualMachine.create_from_image(name, user, arch, cpus, mem, image_oid)
+                if args['disk_source'][0] == 'upload_file':
+                    filename = args['upload_file.filename'][0]
+                    data = args['upload_file'][0]
+                    vm = VirtualMachine.create_from_upload(name, user, arch, cpus, mem, filename, data)
+                if args['disk_source'][0] == 'server_file':
+                    pathname = args['server_file'][0]
+                    if user.may_access_file(pathname):
+                        vm = VirtualMachine.create_from_local(name, user, arch, cpus, mem. pathname)
+                    else:
+                        err = 'Permission denied'
+                if args['disk_source'][0] == 'remote_url':
+                    image_url = args['remote_url'][0]
+                    vm = VirtualMachine.create_from_url(name, user, arch, cpus, mem, image_url)
+            except BaseException as e:
+                err = str(e)
+                vm = None
+            if vm:
+                vms_table.insert(vm)
+                self._send_response(302, {'Location': "/ui/vm?id=%d" % (vm.oid())}, None)
 
         img_id = int(args['img_id'][0]) if 'img_id' in args else None
         r += '  <p style="font-size:150%">Create VM</p>\n'
