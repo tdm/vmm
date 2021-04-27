@@ -87,7 +87,6 @@ import subprocess
 import signal
 import time
 import syslog
-import signal
 import socket
 import select
 import json
@@ -129,6 +128,8 @@ images_table = None
 vms_table = None
 
 leases = {}
+
+running = True
 
 ### Misc utilities ###
 
@@ -490,14 +491,9 @@ def logv(msg):
 
 ### Signal handlers ###
 
-def sig_child(signum, frame):
-    try:
-        pid, status, usage = os.wait3(os.WNOHANG)
-        if pid == 0:
-            return
-        logi("Child pid %d exited with status %d\n" % (pid, status))
-    except:
-        pass
+def sig_term(signum, frame):
+    global running
+    running = False
 
 ### Config ###
 
@@ -1187,7 +1183,6 @@ def raw_cli_listener():
     raw_sock.bind(listen_addr)
     server_sock = raw_sock
     server_sock.listen()
-    running = True
     while running:
         try:
             conn, addr = server_sock.accept()
@@ -1207,7 +1202,6 @@ def ssl_cli_listener():
     ssl_ctx.load_cert_chain(config['ssl.certfile'])
     server_sock = ssl_ctx.wrap_socket(raw_sock, server_side=True)
     server_sock.listen()
-    running = True
     while running:
         try:
             conn, addr = server_sock.accept()
@@ -2476,8 +2470,8 @@ for entry in os.listdir(run_dir):
 
 # XXX: If not debug/foreground, daemonize
 
-# XXX: Probably don't need this anymore
-signal.signal(signal.SIGCHLD, sig_child)
+signal.signal(signal.SIGTERM, sig_term)
+signal.signal(signal.SIGINT, sig_term)
 
 file_copier_thread = threading.Thread(target=file_copier)
 file_copier_thread.daemon = True
@@ -2507,5 +2501,9 @@ if 'http.listen.ssladdress' in config:
     ssl_http_listener_thread.daemon = True
     ssl_http_listener_thread.start()
 
-while True:
+while running:
     time.sleep(1)
+
+for table in [users_table, iso_images_table, disk_images_table, vms_table]:
+    table._lock.acquire()
+dbconn.close()
