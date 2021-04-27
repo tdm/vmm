@@ -1472,24 +1472,19 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             err = None
             msg = None
             img_id = int(args['id'][0])
-            if img_type == 'iso':
-                row = iso_images_table.select_by_oid(img_id)
-            else:
-                row = disk_images_table.select_by_oid(img_id)
+            table = iso_images_table if img_type == 'iso' else disk_images_table
+            row = table.select_by_oid(img_id)
             img = Image(row)
             edit_mode = ('action' in args) and (args['action'][0] == 'Edit')
             if 'action' in args:
                 if args['action'][0] == 'Save':
                     if 'name' in args:
-                        img.name(args['name'][0])
-                    img.public('public' in args)
-                    image_db.save()
+                        img['name'] = args['name'][0]
+                    img['public'] = 1 if 'public' in args else 0
+                    table.update(img)
                     msg = 'Settings saved'
                 if args['action'][0] == 'Delete':
-                    if img_type == 'iso':
-                        iso_images_table.delete(img)
-                    else:
-                        disk_images_table.delete(img)
+                    table.delete(img)
                     path = "/ui/image?type=%s" % (img.type())
                     self._send_response(302, {'Location': path}, None)
                     return
@@ -1503,8 +1498,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (img_id)
             r += '   <table>\n'
             if edit_mode:
-                r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (img.name())
-                val = 'checked' if img.public() else ''
+                r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (img['name'])
+                val = 'checked' if img['public'] else ''
                 r += "    <tr><td style=\"font-weight:bold\">Visibility<td><input type=\"checkbox\" name=\"public\" %s>Public\n" % (val)
                 r += '    <tr><td><input type="submit" name="action" value="Save"><td>&nbsp;\n'
             else:
