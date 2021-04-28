@@ -792,7 +792,6 @@ class VirtualMachine(DbObject):
         (self._disk_psize, self._disk_vsize, self._disk_fmt) = image_info(self['diskpath'])
         self._copy_status = None
         self._pid = self._get_qemu_pid()
-        self._iso_pathname = self._get_iso_pathname()
 
     @staticmethod
     def pathname_for_disk(username, vmname, ext):
@@ -966,9 +965,9 @@ class VirtualMachine(DbObject):
             argv.extend(['-drive', "file=%s,snapshot=on" % (self['diskpath'])])
         else:
             argv.extend(['-drive', "file=%s" % (self['diskpath'])])
-        if self._iso_pathname:
+        if self['isopath']:
             # XXX? -drive media=cdrom,file=%s
-            argv.extend(['-cdrom', self._iso_pathname, '-boot', 'd'])
+            argv.extend(['-cdrom', self['isopath'], '-boot', 'd'])
         if resuming:
             argv.extend(['-loadvm', 'vmm-suspend'])
         try:
@@ -1015,17 +1014,15 @@ class VirtualMachine(DbObject):
             print("Exception running monitor command: %s" % (e))
         return res
 
-    def iso_pathname(self):
-        return self._iso_pathname
     def iso_eject(self):
         if self.running():
             self._run_monitor_command('eject ide1-cd0')
-        self._iso_pathname = None
-    def iso_insert(self, iso_pathname):
+        self['isopath'] = None
+    def iso_insert(self, isopath):
         self.iso_eject()
-        self._iso_pathname = iso_pathname
+        self['isopath'] = isopath
         if self.running():
-            self._run_monitor_command("change ide1-cd0 %s" % (self._iso_pathname))
+            self._run_monitor_command("change ide1-cd0 %s" % (self['isopath']))
 
     def reset(self):
         self._run_monitor_command('system_reset')
@@ -1839,8 +1836,10 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     oid = int(args['iso_image'][0])
                     row = iso_images_table.select_by_oid(oid)
                     vm.iso_insert(row['pathname'])
+                    vms_table.update(vm)
                 if args['action'][0] == 'Eject':
                     vm.iso_eject()
+                    vms_table.update(vm)
                 if args['action'][0] == 'Delete':
                     if not vm.running():
                         file_delete(vm['diskpath'])
@@ -1884,8 +1883,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '   </table>\n'
             r += '   <table>\n'
             r += '    <tr><td style="font-weight:bold">ISO'
-            if vm.iso_pathname():
-                row = iso_images_table.select_one_where("pathname='%s'" % (vm.iso_pathname()))
+            if vm['isopath']:
+                row = iso_images_table.select_one_where("pathname='%s'" % (vm['isopath']))
                 r += "<td>%s<input style=\"float:right\" type=\"submit\" name=\"action\" value=\"Eject\">\n" % (row['name'])
             else:
                 r += "<td>%s<input type=\"submit\" name=\"action\" value=\"Insert\">\n" % (self._iso_image_select())
@@ -2378,7 +2377,8 @@ vms_table = DbTable(dbconn, 'vms',
    vncpass     CHAR(8),
    macaddr     CHAR(17),
    disksize    INTEGER,
-   diskpath    VARCHAR(256)""")
+   diskpath    VARCHAR(256),
+   isopath     VARCHAR(256)""")
 
 if users_table.empty():
     root = User.create('root', 'Root User', 'root', 'admin')
