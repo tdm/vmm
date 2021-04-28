@@ -807,7 +807,7 @@ class VirtualMachine(DbObject):
         argv = [find_in_path('qemu-img'), 'create',
                 '-f', 'qcow2',
                 '-o', 'preallocation=metadata',
-                diskpath, "%dG" % (disk_size)]
+                diskpath, "%dM" % (disk_size)]
         cmd_run(argv)
         return VirtualMachine({'name': name, 'owner': owner['name'],
                                'arch': arch, 'cpus': cpus, 'mem': mem,
@@ -1001,17 +1001,19 @@ class VirtualMachine(DbObject):
         locker = ScopedLocker(self._lock)
         vm_run_dir = "%s/%04x" % (run_dir, self.oid())
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(1.0)
+        res = []
         try:
             sock.connect("%s/monitor" % (vm_run_dir))
-        except:
-            print("mon: failed to connect")
-            return []
-        self._drain_monitor_socket(sock)
-        line = cmd
-        if not line.endswith('\n'):
-            line += '\n'
-        sock.send(line.encode())
-        return self._drain_monitor_socket(sock)
+            self._drain_monitor_socket(sock)
+            line = cmd
+            if not line.endswith('\n'):
+                line += '\n'
+            sock.send(line.encode())
+            res = self._drain_monitor_socket(sock)
+        except BaseException as e:
+            print("Exception running monitor command: %s" % (e))
+        return res
 
     def iso_pathname(self):
         return self._iso_pathname
@@ -1040,6 +1042,7 @@ class VirtualMachine(DbObject):
             os.kill(self._pid, signal.SIGTERM)
             tries = 0
             while tries < 10 and self._pid:
+                tries += 1
                 time.sleep(0.1)
 
     # Used by sig_child()
@@ -1121,9 +1124,10 @@ class CliClientConnectionHandler(threading.Thread):
         if len(args) != 2:
             return '-Invalid usage'
         if is_int(args[0]):
-            user = user_db.get_by_oid(int(args[0]))
+            row = users_table.select_by_oid(int(args[0]))
         else:
-            user = user_db.get_by_name(args[0])
+            row = users_table.select_by_name(args[0])
+        user = User(row)
         if len(args[1]) == 256/8*2:
             if user.pwhash() != args[1]:
                 return '-Unauthorized'
@@ -1833,8 +1837,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     time.sleep(1)
                 if args['action'][0] == 'Insert':
                     oid = int(args['iso_image'][0])
-                    img = image_db.get_by_oid(oid)
-                    vm.iso_insert(img.pathname())
+                    row = iso_images_table.select_by_oid(oid)
+                    vm.iso_insert(row['pathname'])
                 if args['action'][0] == 'Eject':
                     vm.iso_eject()
                 if args['action'][0] == 'Delete':
@@ -1881,12 +1885,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '   <table>\n'
             r += '    <tr><td style="font-weight:bold">ISO'
             if vm.iso_pathname():
-                name = vm.iso_pathname()
-                for oid, iso in image_db.items():
-                    if iso.pathname() == vm.iso_pathname():
-                        name = iso.name()
-                        break
-                r += "<td>%s<input style=\"float:right\" type=\"submit\" name=\"action\" value=\"Eject\">\n" % (name)
+                row = iso_images_table.select_one_where("pathname='%s'" % (vm.iso_pathname()))
+                r += "<td>%s<input style=\"float:right\" type=\"submit\" name=\"action\" value=\"Eject\">\n" % (row['name'])
             else:
                 r += "<td>%s<input type=\"submit\" name=\"action\" value=\"Insert\">\n" % (self._iso_image_select())
             r += '    <tr><td>&nbsp;<td>&nbsp;\n'
