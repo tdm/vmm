@@ -1799,7 +1799,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             vm_id = int(args['id'][0])
             row = vms_table.select_by_oid(vm_id)
             vm = VirtualMachine(row)
-            edit_mode = (not vm.running()) and ('action' in args) and (args['action'][0] == 'Edit')
+            vm_running = vm.running()
+            edit_mode = (not vm_running) and ('action' in args) and (args['action'][0] == 'Edit')
             if 'action' in args:
                 if args['action'][0] == 'Save':
                     if 'name' in args:
@@ -1822,7 +1823,6 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     vm.poweroff()
                 if args['action'][0] == 'Kill':
                     vm.kill()
-                    time.sleep(1)
                 if args['action'][0] == 'Insert':
                     oid = int(args['iso_image'][0])
                     row = iso_images_table.select_by_oid(oid)
@@ -1832,7 +1832,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     vm.iso_eject()
                     vms_table.update(vm)
                 if args['action'][0] == 'Delete':
-                    if not vm.running():
+                    if not vm_running:
                         file_delete(vm['diskpath'])
                         vms_table.delete(vm)
                         self._send_response(302, {'Location': '/ui/vm'}, None)
@@ -1843,6 +1843,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     public = args['image_public'][0]
                     img = Image.create_from_vmdisk(name, vm, user, public)
                     image_db.insert(img)
+                vm_running = vm.running()
+                edit_mode = (not vm_running) and ('action' in args) and (args['action'][0] == 'Edit')
             r += "  <p style=\"font-size:150%%\">%s</p>\n" % (vm['name'])
             if msg:
                 r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
@@ -1860,14 +1862,14 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             else:
                 r += "    <tr><td style=\"font-weight:bold\">CPUs<td>%d\n" % (vm['cpus'])
                 r += "    <tr><td style=\"font-weight:bold\">Mem<td>%s\n" % (readable_size(vm['mem'], ONE_MB))
-                if not vm.running():
+                if not vm_running:
                     r += '    <tr><td><input type="submit" name="action" value="Edit"><td>&nbsp;\n'
             r += "    <tr><td style=\"font-weight:bold\">Disk<td>%s\n" % (readable_size(vm.disk_virtual_size(), ONE_MB))
             r += "    <tr><td style=\"font-weight:bold\">State<td>%s\n" % (vm.state())
             r += "    <tr><td style=\"font-weight:bold\">MAC<td>%s\n" % (vm['macaddr'])
             r += "    <tr><td style=\"font-weight:bold\">Addr<td>%s\n" % (vm.ipv4addr())
             r += '    <tr><td>&nbsp;<td>&nbsp;\n'
-            if vm.running():
+            if vm_running:
                 r += "    <tr><td style=\"font-weight:bold\">VNC Host<td>%s:%d\n" % (server_host, vm_id)
                 r += "    <tr><td style=\"font-weight:bold\">VNC Pass<td>%s\n" % (vm['vncpass'])
                 r += '    <tr><td>&nbsp;<td>&nbsp;\n'
@@ -1881,7 +1883,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 r += "<td>%s<input type=\"submit\" name=\"action\" value=\"Insert\">\n" % (self._iso_image_select())
             r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             pct = acp_progress(vm['diskpath'])
-            if vm.running():
+            if vm_running:
                 r += '    <tr><td colspan="2"><input type="submit" name="action" value="Suspend">\n'
                 r += '    <tr><td colspan="2"><input type="submit" name="action" value="Power Off">\n'
                 r += '    <tr><td colspan="2"><input type="submit" name="action" value="Kill">\n'
