@@ -602,6 +602,9 @@ class DbTable:
         query = "CREATE TABLE IF NOT EXISTS %s (%s)" % (self._name, sql)
         self._dbconn.execute(query)
 
+    def _sql_val_str(self, v):
+        return 'NULL' if v is None else "'%s'" % (v)
+
     def empty(self):
         query = "SELECT COUNT(*) FROM %s" % (self._name)
         cursor = self._dbconn.execute(query)
@@ -648,7 +651,7 @@ class DbTable:
     def insert(self, obj):
         locker = ScopedLocker(self._lock)
         keystr = ','.join(obj.keys())
-        valstr = ','.join(["'%s'" % (v) for v in obj.values()])
+        valstr = ','.join([self._sql_val_str(v) for v in obj.values()])
         query = "INSERT INTO %s (%s) values (%s)" % (self._name, keystr, valstr)
         print("query=%s" % (query))
         cursor = dbconn.execute(query)
@@ -664,7 +667,7 @@ class DbTable:
         for k in obj._changed:
             if k == 'id':
                 continue
-            change_vec.append("%s='%s'" % (k, obj._dict[k]))
+            change_vec.append("%s=%s" % (k, self._sql_val_str(obj._dict[k])))
         query += ','.join(change_vec)
         query += " WHERE id=%d" % (obj._dict['id'])
         self._dbconn.execute(query)
