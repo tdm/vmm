@@ -1804,15 +1804,17 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             if 'action' in args:
                 if args['action'][0] == 'Save':
                     if 'name' in args:
-                        vm.name(args['name'][0])
+                        vm['name'] = args['name'][0]
                     if 'cpus' in args:
-                        vm.cpus(int(args['cpus'][0]))
+                        vm['cpus'] = int(args['cpus'][0])
                     if 'mem' in args:
                         mem = parse_num(args['mem'][0])
                         if mem >= ONE_MB:
                             mem /= ONE_MB
-                        vm.mem(mem)
-                    vm_db.save()
+                        vm['mem'] = mem
+                    if 'vncpass' in args:
+                        vm['vncpass'] = args['vncpass'][0]
+                    vms_table.update(vm)
                     msg = 'Settings saved'
                 if args['action'][0] == 'Start':
                     ro = 'readonly' in args
@@ -1858,6 +1860,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (vm['name'])
                 r += "    <tr><td style=\"font-weight:bold\">CPUs<td><input type=\"number\" name=\"cpus\" value=\"%d\" size=\"6\">\n" % (vm['cpus'])
                 r += "    <tr><td style=\"font-weight:bold\">Mem<td><input type=\"text\" name=\"mem\" value=\"%s\" size=\"6\">\n" % (readable_size(vm['mem'], ONE_MB))
+                r += "    <tr><td style=\"font-weight:bold\">VNC Pass<td><input type=\"text\" name=\"vncpass\" value=\"%s\" size=\"8\">\n" % (vm['vncpass'])
                 r += '    <tr><td><input type="submit" name="action" value="Save"><td>&nbsp;\n'
             else:
                 r += "    <tr><td style=\"font-weight:bold\">CPUs<td>%d\n" % (vm['cpus'])
