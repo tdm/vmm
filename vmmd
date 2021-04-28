@@ -1466,17 +1466,33 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
     def ui_image(self, user, args):
         # XXX: auth
         r = self._html_head(user)
-        # XXX: handle delete better, like user does
-        img_type = args['type'][0]
+        err = None
+        msg = None
+        is_admin = user.in_group('admin')
+        img_type = args['type'][0] if 'type' in args else 'disk'
+        table = iso_images_table if img_type == 'iso' else disk_images_table
         if 'id' in args:
-            err = None
-            msg = None
-            img_id = int(args['id'][0])
-            table = iso_images_table if img_type == 'iso' else disk_images_table
-            row = table.select_by_oid(img_id)
+            args_id = int(args['id'][0])
+            row = table.select_by_oid(args_id)
             img = Image(row)
-            edit_mode = ('action' in args) and (args['action'][0] == 'Edit')
+            if img['owner'] != user['name'] and not img['public'] and not is_admin:
+                r += '  <p>Access denied</p>\n'
+                r += self._html_foot(user)
+                self._send_response(403, None, r)
+                return
+        else:
+            args_id = None
+            img = None
+        # XXX: handle delete better, like user does
+        if img:
+            editable = img['owner'] == user['name'] or is_admin
+            edit_mode = False
             if 'action' in args:
+                if not editable:
+                    err = 'Permission denied'
+                    args['action'][0] = None
+                if args['action'][0] == 'Edit':
+                    edit_mode = True
                 if args['action'][0] == 'Save':
                     if 'name' in args:
                         img['name'] = args['name'][0]
@@ -1492,10 +1508,10 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             if msg:
                 r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
             if err:
-                r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (errmsg)
+                r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (err)
             r += '  <form method="POST" action="/ui/image">\n'
             r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (img_type)
-            r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (img_id)
+            r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (img.oid())
             r += '   <table>\n'
             if edit_mode:
                 r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (img['name'])
@@ -1505,19 +1521,25 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             else:
                 val = 'Public' if img['public'] else 'Private'
                 r += "    <tr><td style=\"font-weight:bold\">Visibility<td>%s\n" % (val)
-                r += '    <tr><td><input type="submit" name="action" value="Edit"><td>&nbsp;\n'
+                if editable:
+                    r += '    <tr><td><input type="submit" name="action" value="Edit"><td>&nbsp;\n'
             r += "    <tr><td style=\"font-weight:bold\">Virtual Size<td>%s\n" % (readable_size(img.virtual_size(), ONE_MB))
             r += "    <tr><td style=\"font-weight:bold\">Physical Size<td>%s\n" % (readable_size(img.physical_size(), ONE_MB))
             r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             pct = acp_progress(img['pathname'])
             if pct is None:
-                r += '    <tr><td><input style="color:red" type="submit" name="action" value="Delete"><td>&nbsp;'
+                if editable:
+                    r += '    <tr><td><input style="color:red" type="submit" name="action" value="Delete"><td>&nbsp;'
             else:
                 r += "   <tr><td style=\"font-weight:bold\">Copying<td>%d%%\n" % (pct)
             r += '   </table>\n'
             r += '  </form>\n'
         else:
             r += "  <p style=\"font-size:150%%\">%s Images</p>\n" % (img_type)
+            if msg:
+                r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
+            if err:
+                r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (err)
             r += '  <form method="GET" action="/ui/image/create">\n'
             r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (img_type)
             r += '   <table width="100%">\n'
@@ -1528,15 +1550,10 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '  <table width="100%">\n'
             r += '   <tr style="font-weight:bold"><td>Name<td>Owner<td>Visibility<td>&nbsp;</tr>\n'
             idx = -1
-            if img_type == 'iso':
-                cursor = iso_images_table.select_all()
-            else:
-                cursor = disk_images_table.select_all()
+            cursor = table.select_all() if is_admin else table.select_where("owner='%s' OR public!=0" % (user['name']))
             for row in cursor:
                 img = Image(row)
                 bgcolor = '#e0e0e0' if (idx % 2) == 0 else 'initial'
-                if img['owner'] != user['name'] and not img['public'] and not user.in_group('admin'):
-                    continue
                 idx += 1
                 r += "   <tr style=\"background-color:%s\">" % (bgcolor)
                 r += "<td><a href=\"/ui/image?type=%s&id=%d\">%s</a>" % (img_type, img['id'], img['name'])
@@ -1836,7 +1853,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             if msg:
                 r += "  <p style=\"font-size:125%%\">%s</p>\n" % (msg)
             if err:
-                r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (errmsg)
+                r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (err)
             r += '  <form method="POST" action="/ui/vm">\n'
             r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (vm_id)
             r += '   <table>\n'
