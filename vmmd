@@ -960,11 +960,11 @@ class VirtualMachine(DbObject):
                 '-usb',
                 '-device', 'usb-tablet',
                 '-netdev', "bridge,br=%s,id=net1" % (config['network.bridge.name']),
-                '-device', "e1000,netdev=net1,mac=%s" % (self['macaddr'])])
+                '-device', "virtio-net,netdev=net1,mac=%s" % (self['macaddr'])])
         if readonly:
-            argv.extend(['-drive', "file=%s,snapshot=on" % (self['diskpath'])])
+            argv.extend(['-drive', "file=%s,if=virtio,snapshot=on" % (self['diskpath'])])
         else:
-            argv.extend(['-drive', "file=%s" % (self['diskpath'])])
+            argv.extend(['-drive', "file=%s,if=virtio" % (self['diskpath'])])
         if self['isopath']:
             # XXX? -drive media=cdrom,file=%s
             argv.extend(['-cdrom', self['isopath'], '-boot', 'd'])
