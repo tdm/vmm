@@ -791,7 +791,6 @@ class VirtualMachine(DbObject):
             self['vncpass'] = pwgen(8)
         (self._disk_psize, self._disk_vsize, self._disk_fmt) = image_info(self['diskpath'])
         self._copy_status = None
-        self._pid = self._get_qemu_pid()
 
     @staticmethod
     def pathname_for_disk(username, vmname, ext):
@@ -860,17 +859,6 @@ class VirtualMachine(DbObject):
 
     def _qemu_pidfile(self):
         return "%s/%04x/qemu.pid" % (run_dir, self.oid())
-    def _get_qemu_pid(self):
-        try:
-            f = open(self._qemu_pidfile(), 'r')
-            buf = f.read()
-            f.close()
-            pid = int(buf.strip())
-            if os.path.isdir("/proc/%d" % (pid)):
-                return pid
-            return None
-        except BaseException as e:
-            return None
     def _get_iso_pathname(self):
         pathname = None
         if self.running():
@@ -916,10 +904,19 @@ class VirtualMachine(DbObject):
     def disk_virtual_size(self):
         return self._disk_vsize
 
-    def running(self):
-        return not self._pid is None
     def pid(self):
-        return self._pid
+        try:
+            f = open(self._qemu_pidfile(), 'r')
+            buf = f.read()
+            f.close()
+            pid = int(buf.strip())
+            if os.path.isdir("/proc/%d" % (pid)):
+                return pid
+            return None
+        except BaseException as e:
+            return None
+    def running(self):
+        return not self.pid() is None
     def state(self):
         if self.running():
             return 'running'
@@ -982,8 +979,6 @@ class VirtualMachine(DbObject):
         if not os.path.exists(self._qemu_pidfile()):
             print("Timed out waiting for pidfile")
             raise RuntimeError("Emulator failed to start")
-        self._pid = self._get_qemu_pid()
-        print("pid=%d" % (self._pid))
         if resuming:
             self._run_monitor_command('delvm vmm-suspend')
         if self['vncpass']:
@@ -1035,20 +1030,13 @@ class VirtualMachine(DbObject):
         self._run_monitor_command('system_powerdown')
 
     def kill(self):
-        if self.running():
-            os.kill(self._pid, signal.SIGTERM)
+        pid = self.pid()
+        if pid:
+            os.kill(pid, signal.SIGTERM)
             tries = 0
-            while tries < 10 and self._pid:
+            while tries < 10 and not self.pid() is None:
                 tries += 1
                 time.sleep(0.1)
-
-    # Used by sig_child()
-    def notify_stopped(self):
-        try:
-            os.unlink(self._qemu_pidfile())
-        except OSError:
-            pass
-        self._pid = None
 
 ### CliClientConnectionHandler and listener ###
 
