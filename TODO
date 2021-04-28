@@ -9,6 +9,7 @@ Need to do
  - Add ability to modify user groups
  - Finish API implementation
  - Security checks for all operations
+ - Detect in-use images by looking for vmdisk backing files
 
 Might do
 ========
