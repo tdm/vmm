@@ -940,29 +940,51 @@ class VirtualMachine(DbObject):
         if force_readonly and not readonly:
             raise RuntimeError("VMDK disks must be read-only")
         resuming = (not readonly) and self._has_snapshot_tag('vmm-suspend')
-        prog = "qemu-system-%s" % (self['arch'])
         vm_run_dir = "%s/%04x" % (run_dir, self.oid())
         mkdir_p(vm_run_dir)
+        has_usb = False
+        has_pci = False
+        if self['arch'] == 'x86_64':
+            prog = 'qemu-system-x86_64'
+            machine_arg = 'pc'
+            if platform.machine() == 'x86_64':
+                machine_arg += ',accel=kvm'
+            cpu_arg = 'host' if config['vm.nesting'] else 'qemu64'
+            has_usb = True
+            has_pci = True
+        elif self['arch'] == 'arm64':
+            prog = 'qemu-system-aarch64'
+            machine_arg = 'virt'
+            cpu_arg = 'cortex-a53'
+            has_pci = True
+        elif self['arch'] == 'rpi3':
+            prog = 'qemu-system-aarch64'
+            machine_arg = 'raspi3'
+            cpu_arg = 'cortex-a53'
+        else:
+            raise RuntimeError('Unknown arch')
         argv = [find_in_path(prog)]
         argv.extend(['-daemonize', '-pidfile', self._qemu_pidfile()])
-        if platform.machine() != 'x86_64' or self['arch'] != 'x86_64':
-            raise RuntimeError("Implement non-x64 support")
-        machine_arg = 'pc,accel=kvm'
-        cpu_arg = 'host' if config['vm.nesting'] else 'qemu64'
         argv.extend(['-machine', machine_arg, '-cpu', cpu_arg])
         ethdev = 'virtio-net' if self['ostype'] == 'linux' else 'e1000'
-        blkif = 'virtio' if self['ostype'] == 'linux' else 'ide'
-        blkopt = ',snapshot=on' if readonly else ''
+        blkopt = ''
+        if self['arch'] == 'x86_64':
+            blkopt += ',if=virtio' if self['ostype'] == 'linux' else ',if=ide'
+        if self['diskpath'].endswith('.img'):
+            blkopt += ',format=raw'
+        if readonly:
+            blkopt += ',snapshot=on'
         argv.extend(['-smp', str(self['cpus']),
                 '-m', "%dM" % self['mem'],
                 '-monitor', "unix:%s/monitor,server,nowait" % (vm_run_dir),
                 '-serial', "unix:%s/serial,server,nowait" % (vm_run_dir),
                 '-vnc', ":%d,password=on" % (self.oid()),
-                '-usb',
-                '-device', 'usb-tablet',
-                '-netdev', "bridge,br=%s,id=net1" % (config['network.bridge.name']),
-                '-device', "%s,netdev=net1,mac=%s" % (ethdev, self['macaddr']),
-                '-drive', "file=%s,if=%s%s" % (self['diskpath'], blkif, blkopt)])
+                '-drive', "file=%s%s" % (self['diskpath'], blkopt)])
+        if has_pci:
+            argv.extend(['-netdev', "bridge,br=%s,id=net1" % (config['network.bridge.name']),
+                         '-device', "%s,netdev=net1,mac=%s" % (ethdev, self['macaddr'])])
+        if has_usb:
+            argv.extend(['-usb', '-device', 'usb-tablet'])
         if self['isopath']:
             # XXX? -drive media=cdrom,file=%s
             argv.extend(['-cdrom', self['isopath'], '-boot', 'd'])
@@ -1362,6 +1384,24 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r += '</select>'
         return r
 
+    def _arch_select(self, arch=None):
+        r = ''
+        r += '<select name="arch">'
+        for val in [ 'x86_64', 'arm64', 'rpi3' ]:
+            sel = ' selected="true"' if val == arch else ''
+            r += "<option value=\"%s\"%s>%s" % (val, sel, val)
+        r += '</select>'
+        return r
+
+    def _ostype_select(self, ostype=None):
+        r = ''
+        r += '<select name="ostype">'
+        for val in [ 'Linux', 'Windows', 'MacOS' ]:
+            sel = ' selected="true"' if val == ostype else ''
+            r += "<option value=\"%s\"%s>%s" % (val, sel, val)
+        r += '</select>'
+        return r
+
     def _iso_image_select(self):
         r = ''
         r += '<select name="iso_image">'
@@ -1378,16 +1418,6 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         for row in disk_images_table.select_all():
             sel = ' selected="true"' if row['id'] == img_id else ''
             r += "<option value=\"%d\"%s>%s" % (row['id'], sel, row['name'])
-        r += '</select>'
-        return r
-
-    def _ostype_select(self, ostype=None):
-        r = ''
-        r += '<select name="ostype">'
-        r += '<option value="">'
-        for val in [ 'Linux', 'Windows', 'MacOS' ]:
-            sel = ' selected="true"' if val == ostype else ''
-            r += "<option value=\"%s\"%s>%s" % (val, sel, val)
         r += '</select>'
         return r
 
@@ -1811,6 +1841,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 if args['action'][0] == 'Save':
                     if 'name' in args:
                         vm['name'] = args['name'][0]
+                    if 'arch' in args:
+                        vm['arch'] = args['arch'][0]
                     if 'cpus' in args:
                         vm['cpus'] = int(args['cpus'][0])
                     if 'mem' in args:
@@ -1864,15 +1896,16 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '  <form method="POST" action="/ui/vm">\n'
             r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (vm_id)
             r += '   <table>\n'
-            #XXX r += "    <tr><td style=\"font-weight:bold\">Arch<td>%s\n" % (vm.arch())
             if edit_mode:
                 r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (vm['name'])
+                r += "    <tr><td style=\"font-weight:bold\">Arch<td>%s\n" % (self._arch_select(vm['arch']))
                 r += "    <tr><td style=\"font-weight:bold\">CPUs<td><input type=\"number\" name=\"cpus\" value=\"%d\" size=\"6\">\n" % (vm['cpus'])
                 r += "    <tr><td style=\"font-weight:bold\">Mem<td><input type=\"text\" name=\"mem\" value=\"%s\" size=\"6\">\n" % (readable_size(vm['mem'], ONE_MB))
                 r += '    <tr><td style="font-weight:bold">OS Type<td>%s\n' % (self._ostype_select(vm['ostype']))
                 r += "    <tr><td style=\"font-weight:bold\">VNC Pass<td><input type=\"text\" name=\"vncpass\" value=\"%s\" size=\"8\">\n" % (vm['vncpass'])
                 r += '    <tr><td><input type="submit" name="action" value="Save"><td>&nbsp;\n'
             else:
+                r += "    <tr><td style=\"font-weight:bold\">Arch<td>%s\n" % (vm['arch'])
                 r += "    <tr><td style=\"font-weight:bold\">CPUs<td>%d\n" % (vm['cpus'])
                 r += "    <tr><td style=\"font-weight:bold\">Mem<td>%s\n" % (readable_size(vm['mem'], ONE_MB))
                 r += "    <tr><td style=\"font-weight:bold\">OS type<td>%s\n" % (vm['ostype'])
@@ -1957,11 +1990,10 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         msg = None
         err = None
         if 'action' in args and args['action'][0] == 'Create':
+            print("Creating VM")
             vm = None
             name = args['name'][0]
             arch = args['arch'][0]
-            if arch != 'x86_64':
-                err = 'Invalid arch'
             cpus = int(args['cpus'][0])
             if cpus < 1 or cpus > 8:
                 err = 'Invalid CPUs'
@@ -2030,6 +2062,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r += '   <table>\n'
         r += '    <input type="hidden" name="arch" value="x86_64">\n'
         r += '    <tr><td style="font-weight:bold">Name<td><input type="text" name="name">\n'
+        r += "    <tr><td style=\"font-weight:bold\">Arch<td>%s\n" % (self._arch_select())
         r += '    <tr><td style="font-weight:bold">CPUs<td><input type="number" name="cpus" size="4">\n'
         r += '    <tr><td style="font-weight:bold">Memory<td><input type="text" name="mem" size="8">\n'
         r += "    <tr><td style=\"font-weight:bold\">OS Type<td>%s\n" % (self._ostype_select())
