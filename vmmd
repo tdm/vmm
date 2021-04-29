@@ -744,12 +744,12 @@ class Image(DbObject):
 
     @staticmethod
     def create_from_vmdisk(name, vm, user, public):
-        filename = os.path.basename(vm.disk_pathname())
+        filename = os.path.basename(vm['diskpath'])
         pathname = "%s/%s" % (config['image.storage.location'], filename)
         if os.path.exists(pathname):
             raise RuntimeError("Image already exists")
         img = Image({'name': name, 'pathname': pathname, 'owner': user['name'], 'public': public})
-        acp_queue(vm.disk_pathname(), img.pathname())
+        acp_queue(vm['diskpath'], img['pathname'])
         return img
 
     def fmt(self):
@@ -1844,7 +1844,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     name = args['image_name'][0]
                     public = args['image_public'][0]
                     img = Image.create_from_vmdisk(name, vm, user, public)
-                    image_db.insert(img)
+                    disk_images_table.insert(img)
                 vm_running = vm.running()
                 edit_mode = (not vm_running) and ('action' in args) and (args['action'][0] == 'Edit')
             r += "  <p style=\"font-size:150%%\">%s</p>\n" % (vm['name'])
