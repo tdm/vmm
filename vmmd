@@ -2210,7 +2210,13 @@ def acp_sparse(srcfile, dstfile, file_size):
     off = 0
     pct = 0
     while off < file_size:
-        off = srcfile.seek(off, os.SEEK_DATA)
+        try:
+            off = srcfile.seek(off, os.SEEK_DATA)
+        except OSError as e:
+            if e.errno == errno.ENXIO:
+                dstfile.truncate(file_size)
+                return
+            raise
         end = srcfile.seek(off, os.SEEK_HOLE)
         srcfile.seek(off)
         dstfile.seek(off)
