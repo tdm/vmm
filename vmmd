@@ -777,19 +777,17 @@ class VirtualMachine(DbObject):
         DbObject.__init__(self, row)
         self._lock = threading.Lock()
         if self['macaddr'] is None:
-            # XXX: make this better
-            allocated = set()
-            for row in vms_table.select_all():
-                allocated.add(row['macaddr'])
             found = False
             while not found:
                 b4 = int(random.random() * 256)
                 b5 = int(random.random() * 256)
                 b6 = int(random.random() * 256)
-                mac_addr = "52:54:00:%02x:%02x:%02x" % (b4, b5, b6)
-                if not mac_addr in allocated:
+                macaddr = "52:54:00:%02x:%02x:%02x" % (b4, b5, b6)
+                cursor = vms_table.select_where("macaddr='%s'" % (macaddr))
+                row = cursor.fetchone()
+                if not row:
                     found = True
-            self['macaddr'] = mac_addr
+            self['macaddr'] = macaddr
         if self['vncpass'] is None:
             self['vncpass'] = pwgen(8)
         (self._disk_psize, self._disk_vsize, self._disk_fmt) = image_info(self['diskpath'])
