@@ -950,6 +950,9 @@ class VirtualMachine(DbObject):
         machine_arg = 'pc,accel=kvm'
         cpu_arg = 'host' if config['vm.nesting'] else 'qemu64'
         argv.extend(['-machine', machine_arg, '-cpu', cpu_arg])
+        ethdev = 'virtio-net' if self['ostype'] == 'linux' else 'e1000'
+        blkif = 'virtio' if self['ostype'] == 'linux' else 'ide'
+        blkopt = ',snapshot=on' if readonly else ''
         argv.extend(['-smp', str(self['cpus']),
                 '-m', "%dM" % self['mem'],
                 '-monitor', "unix:%s/monitor,server,nowait" % (vm_run_dir),
@@ -958,11 +961,8 @@ class VirtualMachine(DbObject):
                 '-usb',
                 '-device', 'usb-tablet',
                 '-netdev', "bridge,br=%s,id=net1" % (config['network.bridge.name']),
-                '-device', "virtio-net,netdev=net1,mac=%s" % (self['macaddr'])])
-        if readonly:
-            argv.extend(['-drive', "file=%s,if=virtio,snapshot=on" % (self['diskpath'])])
-        else:
-            argv.extend(['-drive', "file=%s,if=virtio" % (self['diskpath'])])
+                '-device', "%s,netdev=net1,mac=%s" % (ethdev, self['macaddr']),
+                '-drive', "file=%s,if=%s%s" % (self['diskpath'], blkif, blkopt)])
         if self['isopath']:
             # XXX? -drive media=cdrom,file=%s
             argv.extend(['-cdrom', self['isopath'], '-boot', 'd'])
@@ -1365,9 +1365,9 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
     def _iso_image_select(self):
         r = ''
         r += '<select name="iso_image">'
-        r += '<option value=""></option>'
+        r += '<option value="">'
         for row in iso_images_table.select_all():
-            r += "<option value=\"%d\">%s</option>" % (row['id'], row['name'])
+            r += "<option value=\"%d\">%s" % (row['id'], row['name'])
         r += '</select>'
         return r
 
@@ -1376,10 +1376,18 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r += '<select name="disk_image">'
         r += '<option value=""></option>'
         for row in disk_images_table.select_all():
-            if row['id'] == img_id:
-                r += "<option value=\"%d\" selected=\"true\">%s</option>" % (row['id'], row['name'])
-            else:
-                r += "<option value=\"%d\">%s</option>" % (row['id'], row['name'])
+            sel = ' selected="true"' if row['id'] == img_id else ''
+            r += "<option value=\"%d\"%s>%s" % (row['id'], sel, row['name'])
+        r += '</select>'
+        return r
+
+    def _ostype_select(self, ostype=None):
+        r = ''
+        r += '<select name="ostype">'
+        r += '<option value="">'
+        for val in [ 'Linux', 'Windows', 'MacOS' ]:
+            sel = ' selected="true"' if val == ostype else ''
+            r += "<option value=\"%s\"%s>%s" % (val, sel, val)
         r += '</select>'
         return r
 
@@ -1810,6 +1818,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                         if mem >= ONE_MB:
                             mem /= ONE_MB
                         vm['mem'] = mem
+                    if 'ostype' in args:
+                        vm['ostype'] = args['ostype'][0]
                     if 'vncpass' in args:
                         vm['vncpass'] = args['vncpass'][0]
                     vms_table.update(vm)
@@ -1859,11 +1869,13 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (vm['name'])
                 r += "    <tr><td style=\"font-weight:bold\">CPUs<td><input type=\"number\" name=\"cpus\" value=\"%d\" size=\"6\">\n" % (vm['cpus'])
                 r += "    <tr><td style=\"font-weight:bold\">Mem<td><input type=\"text\" name=\"mem\" value=\"%s\" size=\"6\">\n" % (readable_size(vm['mem'], ONE_MB))
+                r += '    <tr><td style="font-weight:bold">OS Type<td>%s\n' % (self._ostype_select(vm['ostype']))
                 r += "    <tr><td style=\"font-weight:bold\">VNC Pass<td><input type=\"text\" name=\"vncpass\" value=\"%s\" size=\"8\">\n" % (vm['vncpass'])
                 r += '    <tr><td><input type="submit" name="action" value="Save"><td>&nbsp;\n'
             else:
                 r += "    <tr><td style=\"font-weight:bold\">CPUs<td>%d\n" % (vm['cpus'])
                 r += "    <tr><td style=\"font-weight:bold\">Mem<td>%s\n" % (readable_size(vm['mem'], ONE_MB))
+                r += "    <tr><td style=\"font-weight:bold\">OS type<td>%s\n" % (vm['ostype'])
                 if not vm_running:
                     r += '    <tr><td><input type="submit" name="action" value="Edit"><td>&nbsp;\n'
             r += "    <tr><td style=\"font-weight:bold\">Disk<td>%s\n" % (readable_size(vm.disk_virtual_size(), ONE_MB))
@@ -2020,6 +2032,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r += '    <tr><td style="font-weight:bold">Name<td><input type="text" name="name">\n'
         r += '    <tr><td style="font-weight:bold">CPUs<td><input type="number" name="cpus" size="4">\n'
         r += '    <tr><td style="font-weight:bold">Memory<td><input type="text" name="mem" size="8">\n'
+        r += "    <tr><td style=\"font-weight:bold\">OS Type<td>%s\n" % (self._ostype_select())
         r += '    <tr><td style="font-weight:bold">Disk Source<td><select name="disk_source" onChange="diskSourceSelected(this);">'
         r += '<option value="create_new">Create New</option>'
         if img_id:
@@ -2369,6 +2382,7 @@ vms_table = DbTable(dbconn, 'vms',
    arch        VARCHAR(64),
    cpus        INTEGER,
    mem         INTEGER,
+   ostype      VARCHAR(64),
    vncpass     CHAR(8),
    macaddr     CHAR(17),
    disksize    INTEGER,
