@@ -1835,7 +1835,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     vms_table.update(vm)
                 if args['action'][0] == 'Delete':
                     if not vm_running:
-                        file_delete(vm['diskpath'])
+                        if vm['diskpath'].startswith(config['disk.storage.location']):
+                            file_delete(vm['diskpath'])
                         vms_table.delete(vm)
                         self._send_response(302, {'Location': '/ui/vm'}, None)
                     else:
