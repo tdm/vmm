@@ -667,10 +667,8 @@ class DbTable:
         keystr = ','.join(obj.keys())
         valstr = ','.join([self._sql_val_str(v) for v in obj.values()])
         query = "INSERT INTO %s (%s) values (%s)" % (self._name, keystr, valstr)
-        print("query=%s" % (query))
         cursor = dbconn.execute(query)
         obj['id'] = cursor.lastrowid
-        print("id=%d" % (cursor.lastrowid))
 
     def update(self, obj):
         if not obj._changed:
@@ -747,7 +745,6 @@ class Image(DbObject):
         if os.path.exists(pathname):
             raise RuntimeError("Image already exists")
         img = Image({'name': name, 'pathname': pathname, 'owner': user['name'], 'public': public})
-        print("Image: add %s to fetch queue" % (url))
         acp_queue(url, pathname)
         return img
 
@@ -933,7 +930,6 @@ class VirtualMachine(DbObject):
         return 'stopped'
 
     def ipv4addr(self):
-        print("mac=%s leases=%s" % (self['macaddr'], leases))
         return leases.get(self['macaddr'], None)
 
     def ipv6addr(self, val=None):
@@ -1999,7 +1995,6 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         msg = None
         err = None
         if 'action' in args and args['action'][0] == 'Create':
-            print("Creating VM")
             vm = None
             name = args['name'][0]
             arch = args['arch'][0]
@@ -2249,7 +2244,6 @@ def acp_simple(srcfile, dstfile, file_size):
         off += len(buf)
         curpct = int(100 * off / file_size)
         if curpct != pct:
-            print("acp_simple: dstfile=%s curpct=%d" % (dstfile, curpct))
             pct = curpct
             _acp_lock.acquire()
             _acp_pct = pct
@@ -2341,7 +2335,6 @@ def lease_updater():
                     new_leases[macaddr] = ipv4addr
                 f.close()
                 leases = new_leases
-                print("leases=%s" % (leases))
         except OSError as e:
             last_mtime = 0
         except BaseException as e:
