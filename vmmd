@@ -591,9 +591,6 @@ class DbObject:
         self._changed.add(name)
         self._dict[name] = val
 
-    def oid(self):
-        return self._dict['id']
-
 class DbTable:
     def __init__(self, dbconn, name, sql):
         self._dbconn = dbconn
@@ -642,8 +639,8 @@ class DbTable:
             raise RuntimeError("Unexpected row count")
         return row
 
-    def select_by_oid(self, oid):
-        res = self.select_where("id=%d" % (oid))
+    def select_by_id(self, id):
+        res = self.select_where("id=%d" % (id))
         if not res:
             return None
         return res.fetchone()
@@ -708,7 +705,6 @@ class User(DbObject):
 
 ### Image ###
 class Image(DbObject):
-    _oid_map = set()
     def __init__(self, row):
         DbObject.__init__(self, row)
         self._copy_status = None
@@ -815,9 +811,9 @@ class VirtualMachine(DbObject):
                                'diskpath': diskpath, 'macaddr': None, 'vncpass': None})
 
     @staticmethod
-    def create_from_image(name, owner, arch, cpus, mem, image_oid):
+    def create_from_image(name, owner, arch, cpus, mem, image_id):
         # XXX: deal with LVM
-        img = disk_images_table.select_by_oid(image_oid)
+        img = disk_images_table.select_by_id(image_id)
         (root, ext) = os.path.splitext(img['pathname'])
         diskpath = VirtualMachine.pathname_for_disk(owner['name'], name, ext)
         if os.path.exists(diskpath):
@@ -861,7 +857,7 @@ class VirtualMachine(DbObject):
         return vm
 
     def _qemu_pidfile(self):
-        return "%s/%04x/qemu.pid" % (run_dir, self.oid())
+        return "%s/%04x/qemu.pid" % (run_dir, self['id'])
     def _get_iso_pathname(self):
         pathname = None
         if self.running():
@@ -942,7 +938,7 @@ class VirtualMachine(DbObject):
         if force_readonly and not readonly:
             raise RuntimeError("VMDK disks must be read-only")
         resuming = (not readonly) and self._has_snapshot_tag('vmm-suspend')
-        vm_run_dir = "%s/%04x" % (run_dir, self.oid())
+        vm_run_dir = "%s/%04x" % (run_dir, self['id'])
         mkdir_p(vm_run_dir)
         has_usb = False
         has_pci = False
@@ -980,7 +976,7 @@ class VirtualMachine(DbObject):
                 '-m', "%dM" % self['mem'],
                 '-monitor', "unix:%s/monitor,server,nowait" % (vm_run_dir),
                 '-serial', "unix:%s/serial,server,nowait" % (vm_run_dir),
-                '-vnc', ":%d,password=on" % (self.oid()),
+                '-vnc', ":%d,password=on" % (self['id']),
                 '-drive', "file=%s%s" % (self['diskpath'], blkopt)])
         if has_pci:
             argv.extend(['-netdev', "bridge,br=%s,id=net1" % (config['network.bridge.name']),
@@ -1018,7 +1014,7 @@ class VirtualMachine(DbObject):
 
     def _run_monitor_command(self, cmd):
         locker = ScopedLocker(self._lock)
-        vm_run_dir = "%s/%04x" % (run_dir, self.oid())
+        vm_run_dir = "%s/%04x" % (run_dir, self['id'])
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(1.0)
         res = []
@@ -1134,7 +1130,7 @@ class CliClientConnectionHandler(threading.Thread):
         if len(args) != 2:
             return '-Invalid usage'
         if is_int(args[0]):
-            row = users_table.select_by_oid(int(args[0]))
+            row = users_table.select_by_id(int(args[0]))
         else:
             row = users_table.select_by_name(args[0])
         user = User(row)
@@ -1151,7 +1147,7 @@ class CliClientConnectionHandler(threading.Thread):
         if len(args) != 1:
             return '-Invalid usage'
         if is_int(args[0]):
-            row = vms_table.select_by_oid(int(args[0]))
+            row = vms_table.select_by_id(int(args[0]))
         else:
             row = vms_table.select_by_name(args[0])
         if row['owner'] != self._user['name'] and not self._user.in_group('admin'):
@@ -1275,7 +1271,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         args_id = None
         if 'id' in args:
             args_id = int(args['id'][0])
-            if args_id != user.oid() and not is_admin:
+            if args_id != user['id'] and not is_admin:
                 self._send_response(403, None, json.dumps({'result': 403}))
         if 'action' in args:
             changed = False
@@ -1372,15 +1368,6 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += ' </table>\n'
         r += ' </body>\n'
         r += '</html>\n'
-        return r
-
-    def _user_select(self):
-        r = ''
-        r += '<select name="user">'
-        r += '<option value=""></option>'
-        for oid, user in user_db.items():
-            r += "<option value=\"%d\">%s (%s)</option>" % (oid, user.name(), user.fullname())
-        r += '</select>'
         return r
 
     def _arch_select(self, arch=None):
@@ -1503,7 +1490,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         table = iso_images_table if img_type == 'iso' else disk_images_table
         if 'id' in args:
             args_id = int(args['id'][0])
-            row = table.select_by_oid(args_id)
+            row = table.select_by_id(args_id)
             img = Image(row)
             if img['owner'] != user['name'] and not img['public'] and not is_admin:
                 r += '  <p>Access denied</p>\n'
@@ -1541,7 +1528,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (err)
             r += '  <form method="POST" action="/ui/image">\n'
             r += "   <input type=\"hidden\" name=\"type\" value=\"%s\">\n" % (img_type)
-            r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (img.oid())
+            r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (img['id'])
             r += '   <table>\n'
             if edit_mode:
                 r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (img['name'])
@@ -1633,7 +1620,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     iso_images_table.insert(img)
                 else:
                     disk_images_table.insert(img)
-                self._send_response(302, {'Location': "/ui/image?type=%s&id=%d" % (img_type, img.oid())}, None)
+                self._send_response(302, {'Location': "/ui/image?type=%s&id=%d" % (img_type, img['id'])}, None)
 
         r += '  <p style="font-size:150%">Create Image</p>\n'
         if msg:
@@ -1682,12 +1669,12 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
         r = self._html_head(user)
         if 'id' in args:
             args_id = int(args['id'][0])
-            if args_id != user.oid() and not is_admin:
+            if args_id != user['id'] and not is_admin:
                 r += '  <p>Access denied</p>\n'
                 r += self._html_foot(user)
                 self._send_response(403, None, r)
                 return
-            row = users_table.select_by_oid(args_id)
+            row = users_table.select_by_id(args_id)
             user = User(row)
         msg = None
         err = None
@@ -1753,16 +1740,16 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += '  <table width="100%">\n'
             r += '   <tr><td>Name<td>Full name<td>&nbsp;\n'
             for row in users_table.select_all():
-                u = User(row)
-                r += "   <tr><td><a href=\"/ui/user?id=%d\">%s</a><td>%s" % (u.oid(), u['name'], u['fullname'])
+                user = User(row)
+                r += "   <tr><td><a href=\"/ui/user?id=%d\">%s</a><td>%s" % (user['id'], user['name'], user['fullname'])
                 r += '<td><form method="POST" action="/ui/user">'
-                r += "<input type=\"hidden\" name=\"id\" value=\"%d\">" % (u.oid())
+                r += "<input type=\"hidden\" name=\"id\" value=\"%d\">" % (user['id'])
                 r += '<input type="submit" name="action" value="Delete">\n'
                 r += '</form>\n'
             r += '  </table>\n'
         else:
             r += '  <form method="POST" action="/ui/user">\n'
-            r += "   <input type=\"hidden\" name=\"id\" value=%d>\n" % (user.oid())
+            r += "   <input type=\"hidden\" name=\"id\" value=%d>\n" % (user['id'])
             r += '   <table width="100%">\n'
             r += '    <tr><td style="font-size:80%;font-weight:bold">Full name<td>&nbsp;\n'
             r += "    <tr><td><input type=\"text\" name=\"fullname\" value=\"%s\"><td>&nbsp;\n" % (user['fullname'])
@@ -1836,7 +1823,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             if ':' in server_host:
                 server_host = server_host.split(':')[0]
             vm_id = int(args['id'][0])
-            row = vms_table.select_by_oid(vm_id)
+            row = vms_table.select_by_id(vm_id)
             vm = VirtualMachine(row)
             vm_running = vm.running()
             edit_mode = (not vm_running) and ('action' in args) and (args['action'][0] == 'Edit')
@@ -1869,8 +1856,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 if args['action'][0] == 'Kill':
                     vm.kill()
                 if args['action'][0] == 'Insert':
-                    oid = int(args['iso_image'][0])
-                    row = iso_images_table.select_by_oid(oid)
+                    id = int(args['iso_image'][0])
+                    row = iso_images_table.select_by_id(id)
                     vm.iso_insert(row['pathname'])
                     vms_table.update(vm)
                 if args['action'][0] == 'Eject':
@@ -1979,7 +1966,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 if vm.running():
                     addr = vm.ipv4addr()
                 r += "   <tr style=\"background-color:%s\">" % (bgcolor)
-                r += "<td><a href=\"/ui/vm?id=%d\">%s</a>" % (vm.oid(), vm['name'])
+                r += "<td><a href=\"/ui/vm?id=%d\">%s</a>" % (vm['id'], vm['name'])
                 r += "<td>%s" % (vm.state())
                 r += "<td>%s" % (addr)
                 # XXX: create-time (age), on-time (uptime)
@@ -2014,8 +2001,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                         err = 'Invalid disk size'
                     vm = VirtualMachine.create_new(name, user, arch, cpus, mem, disk_size)
                 if args['disk_source'][0] == 'use_image':
-                    image_oid = int(args['disk_image'][0])
-                    vm = VirtualMachine.create_from_image(name, user, arch, cpus, mem, image_oid)
+                    image_id = int(args['disk_image'][0])
+                    vm = VirtualMachine.create_from_image(name, user, arch, cpus, mem, image_id)
                 if args['disk_source'][0] == 'upload_file':
                     filename = args['upload_file.filename'][0]
                     data = args['upload_file'][0]
@@ -2034,7 +2021,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 vm = None
             if vm:
                 vms_table.insert(vm)
-                self._send_response(302, {'Location': "/ui/vm?id=%d" % (vm.oid())}, None)
+                self._send_response(302, {'Location': "/ui/vm?id=%d" % (vm['id'])}, None)
 
         img_id = int(args['img_id'][0]) if 'img_id' in args else None
         r += '  <p style="font-size:150%">Create VM</p>\n'
@@ -2147,7 +2134,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                         try:
                             row = sessions_table.select_one_where("hash='%s'" % (v))
                             session = DbObject(row)
-                            row = users_table.select_by_oid(session['user_id'])
+                            row = users_table.select_by_id(session['user_id'])
                             user = User(row)
                             now = int(time.time())
                             session['expire'] = now + config['ui.session.duration']
