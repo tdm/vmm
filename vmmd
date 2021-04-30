@@ -332,7 +332,7 @@ def image_info(pathname):
         pass
     out = ''
     try:
-        argv = [find_in_path('qemu-img'), 'info', '-U', pathname]
+        argv = ['qemu-img', 'info', '-U', pathname]
         (out, err) = cmd_run(argv)
     except RuntimeError as e:
         pass
@@ -453,6 +453,8 @@ def pidfile_remove(name, path=None):
 
 def cmd_run(args, stdin=None):
     logi("cmd_run: %s\n" % (args))
+    if not args[0].startswith('/'):
+        args[0] = find_in_path(args[0])
     child = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if not stdin is None:
         child.stdin.write(stdin)
@@ -464,10 +466,11 @@ def cmd_run(args, stdin=None):
 
 def fork_child(args):
     logi("fork_child: %s" % (args))
+    cmd = args[0] if args[0].startswith('/') else find_in_path(args[0])
     pid = os.fork()
     if pid == 0:
         try:
-            os.execv(args[0], args)
+            os.execv(cmd, args)
         except BaseException as e:
             sys.stderr.write("os.execv raised %s\n" % (e))
         sys.stderr.write("os.execv returned unexpectedly\n")
@@ -809,7 +812,7 @@ class VirtualMachine(DbObject):
         diskpath = VirtualMachine.pathname_for_disk(owner['name'], name, '.qcow2')
         if os.path.exists(diskpath):
             raise RuntimeError("Disk already exists")
-        argv = [find_in_path('qemu-img'), 'create',
+        argv = ['qemu-img', 'create',
                 '-f', 'qcow2',
                 '-o', 'preallocation=metadata',
                 diskpath, "%dM" % (disk_size)]
@@ -827,7 +830,7 @@ class VirtualMachine(DbObject):
         if os.path.exists(diskpath):
             raise RuntimeError("Disk already exists")
         if ext == '.qcow2':
-            argv = [find_in_path('qemu-img'), 'create', '-f', 'qcow2', '-b', img['pathname'], diskpath]
+            argv = ['qemu-img', 'create', '-f', 'qcow2', '-b', img['pathname'], diskpath]
             cmd_run(argv)
         else:
             acp_queue(img['pathname'], diskpath)
@@ -882,7 +885,7 @@ class VirtualMachine(DbObject):
     def _snapshot_list(self):
         snapshots = []
         if self['diskpath'].endswith('.qcow2'):
-            argv = [find_in_path('qemu-img'), 'snapshot', '-l', self['diskpath']]
+            argv = ['qemu-img', 'snapshot', '-l', self['diskpath']]
             (out, err) = cmd_run(argv)
             for line in out.rstrip('\n').split('\n'):
                 fields = line.split()
@@ -968,7 +971,7 @@ class VirtualMachine(DbObject):
             cpu_arg = 'cortex-a53'
         else:
             raise RuntimeError('Unknown arch')
-        argv = [find_in_path(prog)]
+        argv = [prog]
         argv.extend(['-daemonize', '-pidfile', self._qemu_pidfile()])
         argv.extend(['-machine', machine_arg, '-cpu', cpu_arg])
         ethdev = 'virtio-net' if self['ostype'] == 'linux' else 'e1000'
@@ -2493,23 +2496,20 @@ if vms_table.empty():
 # Setup networking
 
 if config['network.mode'] == 'bridge':
-    argv = [find_in_path('brctl'),
-            'addbr', config['network.bridge.name']]
+    argv = ['brctl', 'addbr', config['network.bridge.name']]
     try:
         cmd_run(argv)
     except:
         # XXX: handle errors other than already exists
         pass
-    argv = [find_in_path('ip'),
-            'addr', 'add', config['network.bridge.addr'],
-            'dev', config['network.bridge.name']]
+    argv = ['ip', 'addr', 'add', config['network.bridge.addr'],
+                  'dev', config['network.bridge.name']]
     try:
         cmd_run(argv)
     except:
         # XXX: handle errors other than already exists
         pass
-    argv = [find_in_path('ip'),
-            'link', 'set', config['network.bridge.name'], 'up']
+    argv = ['ip', 'link', 'set', config['network.bridge.name'], 'up']
     try:
         cmd_run(argv)
     except:
@@ -2536,8 +2536,7 @@ if config['network.mode'] == 'bridge':
         f.write("dhcp-range=%s,%s\n" % (config['network.dhcp.start'], config['network.dhcp.end']))
         f.write("dhcp-authoritative\n")
         f.close()
-        args = []
-        args.append(find_in_path('dnsmasq'))
+        args = ['dnsmasq']
         args.append("--conf-file=%s" % (cfg_filename))
         fork_child(args)
 
