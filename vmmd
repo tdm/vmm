@@ -613,14 +613,20 @@ class DbTable:
 
     def select_all(self):
         locker = ScopedLocker(self._lock)
-        obj = None
-        query = "SELECT * from %s" % (self._name)
+        query = "SELECT * FROM %s" % (self._name)
         return dbconn.execute(query)
 
     def select_where(self, wherestr):
         locker = ScopedLocker(self._lock)
-        obj = None
-        query = "SELECT * from %s WHERE %s" % (self._name, wherestr)
+        query = "SELECT * FROM %s WHERE %s" % (self._name, wherestr)
+        res = dbconn.execute(query)
+        if res is None:
+            res = []
+        return res
+
+    def delete_where(self, wherestr):
+        locker = ScopedLocker(self._lock)
+        query = "DELETE FROM %s WHERE %s" % (self._name, wherestr)
         res = dbconn.execute(query)
         if res is None:
             res = []
@@ -686,10 +692,6 @@ class User(DbObject):
     def create(name, fullname, password, groups):
         return User({'name': name, 'fullname': fullname,
                      'pwhash': sha256_string(password), 'groups': groups})
-
-    def create_session(self):
-        self['session'] = sha256_string("%s%s%s" % (self['name'], self['pwhash'], time.time()))
-        return self['session']
 
     def auth_password(self, password):
         pwhash = sha256_string(password)
@@ -1225,9 +1227,6 @@ def ssl_cli_listener():
 ### HttpClientRequestHandler and http_listener ###
 
 class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
-    # XXX: make global, expire on timer, save/load in run_dir
-    _sessions = {}
-
     def __init__(self, request, client_address, server):
         self._dispatch_table = {
             '/api/v1/user':         self._api_v1_user,
@@ -1430,9 +1429,12 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 user = User(row)
                 password = args['password'][0]
                 if user.auth_password(args['password'][0]):
-                    session = sha256_string("%s%s%s" % (user['name'], user['pwhash'], time.time()))
-                    self._sessions[session] = user
-                    cookie = "session=%s; path=/ui" % session
+                    now = int(time.time())
+                    hash = sha256_string("%s%s%s" % (user['name'], user['pwhash'], now))
+                    expire = now + config['ui.session.duration']
+                    session = {'hash': hash, 'user_id': user['id'], 'expire': expire}
+                    sessions_table.insert(session)
+                    cookie = "session=%s; path=/ui" % session['hash']
                     self._send_response(302, {'Set-Cookie': cookie, 'Location': '/ui'}, None)
                     return
             msg = 'Login failed'
@@ -1728,7 +1730,8 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 msg = 'User deleted'
                 args_id = None
             if args['action'][0] == 'Generate':
-                token = sha256_string("%s%s%s" % (user['name'], user['pwhash'], time.time()))
+                now = int(time.time())
+                token = sha256_string("%s%s%s" % (user['name'], user['pwhash'], now))
                 user['token'] = token
                 changed = True
             if changed:
@@ -2141,7 +2144,16 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                 for kvp in self.headers['Cookie'].split(';'):
                     (k, v) = kvp.strip().split('=', 1)
                     if k == 'session':
-                        user = self._sessions.get(v, None)
+                        try:
+                            row = sessions_table.select_one_where("hash='%s'" % (v))
+                            session = DbObject(row)
+                            row = users_table.select_by_oid(session['user_id'])
+                            user = User(row)
+                            now = int(time.time())
+                            session['expire'] = now + config['ui.session.duration']
+                            sessions_table.update(session)
+                        except RuntimeError as e:
+                            pass
             if not user and path != '/ui/login':
                 self._send_response(302, {'Location': '/ui/login'}, None)
                 return
@@ -2271,7 +2283,7 @@ def file_copier():
     global _acp_src
     global _acp_dst
     global _acp_pct
-    while True:
+    while running:
         try:
             src = None
             _acp_lock.acquire()
@@ -2308,7 +2320,7 @@ def lease_updater():
     global leases
     leases_pathname = "%s/dnsmasq.leases" % (state_dir)
     last_mtime = 0
-    while True:
+    while running:
         try:
             cur_mtime = os.stat(leases_pathname)
             if cur_mtime != last_mtime:
@@ -2330,6 +2342,14 @@ def lease_updater():
             loge("Exception in lease_updater thread: %s" % (e))
         time.sleep(1)
 
+### Session expirer ###
+
+def session_expirer():
+    while running:
+        now = int(time.time())
+        sessions_table.delete_where("expire < %d" % (now))
+        time.sleep(60)
+
 ### Main ###
 
 config_defaults = {
@@ -2337,6 +2357,7 @@ config_defaults = {
     'http.listen.port': 8080,
 
     'ui.imagepath': 'https://www.nwwn.com/vmm/images',
+    'ui.session.duration': 3600,
 
     'iso.storage.location': '/var/lib/vmm/isos',
     'image.storage.location': '/var/lib/vmm/images',
@@ -2427,6 +2448,12 @@ vms_table = DbTable(dbconn, 'vms',
    disksize    INTEGER,
    diskpath    VARCHAR(256),
    isopath     VARCHAR(256)""")
+
+sessions_table = DbTable(dbconn, 'sessions',
+"""id          INTEGER PRIMARY KEY,
+   hash        CHAR(64),
+   user_id     INTEGER,
+   expire      INTEGER""")
 
 if users_table.empty():
     root = User.create('root', 'Root User', 'root', 'admin')
@@ -2540,6 +2567,10 @@ file_copier_thread.start()
 lease_updater_thread = threading.Thread(target=lease_updater)
 lease_updater_thread.daemon = True
 lease_updater_thread.start()
+
+session_expirer_thread = threading.Thread(target=session_expirer)
+session_expirer_thread.daemon = True
+session_expirer_thread.start()
 
 if 'cli.listen.address' in config:
     raw_cli_listener_thread = threading.Thread(target=raw_cli_listener)

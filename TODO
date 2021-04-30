@@ -2,7 +2,6 @@ Need to do
 ==========
  - Implement user local-uid field
  - Ensure daemon mode and logging work
- - Save session tokens in run_dir
  - Ensure thread locks are proper
  - Add download/copy pct to image detail
  - Track references to images and isos
