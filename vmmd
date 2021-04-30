@@ -1825,15 +1825,25 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
     def ui_vm(self, user, args):
         # XXX: auth
         r = self._html_head(user)
+        err = None
+        msg = None
+        is_admin = user.in_group('admin')
         if 'id' in args:
-            err = None
-            msg = None
+            args_id = int(args['id'][0])
+            row = vms_table.select_by_id(args_id)
+            vm = VirtualMachine(row)
+            if vm['owner'] != user['name'] and not is_admin:
+                r += '  <p>Access denied</p>\n'
+                r += self._html_foot(user)
+                self._send_response(403, None, r)
+                return
+        else:
+            args_id = None
+            vm = None
+        if vm:
             server_host = self.headers['Host']
             if ':' in server_host:
                 server_host = server_host.split(':')[0]
-            vm_id = int(args['id'][0])
-            row = vms_table.select_by_id(vm_id)
-            vm = VirtualMachine(row)
             vm_running = vm.running()
             edit_mode = (not vm_running) and ('action' in args) and (args['action'][0] == 'Edit')
             if 'action' in args:
@@ -1893,7 +1903,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             if err:
                 r += "  <p style=\"font-size:125%%;color:red\">%s</p>\n" % (err)
             r += '  <form method="POST" action="/ui/vm">\n'
-            r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (vm_id)
+            r += "   <input type=\"hidden\" name=\"id\" value=\"%d\">\n" % (args_id)
             r += '   <table>\n'
             if edit_mode:
                 r += "    <tr><td style=\"font-weight:bold\">Name<td><input type=\"text\" name=\"name\" value=\"%s\">\n" % (vm['name'])
@@ -1916,7 +1926,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
             r += "    <tr><td style=\"font-weight:bold\">Addr<td>%s\n" % (vm.ipv4addr())
             r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             if vm_running:
-                r += "    <tr><td style=\"font-weight:bold\">VNC Host<td>%s:%d\n" % (server_host, vm_id)
+                r += "    <tr><td style=\"font-weight:bold\">VNC Host<td>%s:%d\n" % (server_host, args_id)
                 r += "    <tr><td style=\"font-weight:bold\">VNC Pass<td>%s\n" % (vm['vncpass'])
                 r += '    <tr><td>&nbsp;<td>&nbsp;\n'
             r += '   </table>\n'
