@@ -1149,14 +1149,14 @@ class CliClientConnectionHandler(threading.Thread):
         if len(args) != 1:
             return '-Invalid usage'
         if is_int(args[0]):
-            vm = vm_db.get_by_oid(int(args[0]))
+            row = vms_table.select_by_oid(int(args[0]))
         else:
-            vm = vm_db.get_by_name(args[0])
-        if vm.owner().name() != self._user.name() and not self._user.in_group('admin'):
+            row = vms_table.select_by_name(args[0])
+        if row['owner'] != self._user['name'] and not self._user.in_group('admin'):
             return '-Unauthorized'
-        self.send_msg("Connecting to %s ...\n" % (vm.name()))
+        self.send_msg("Connecting to %s ...\n" % (row['name']))
         vm_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        vm_sock.connect("%s/%04x/%s" % (run_dir, vm.oid(), name))
+        vm_sock.connect("%s/%04x/%s" % (run_dir, row['id'], name))
         self.send_msg("Escape char is '^['\n")
         try:
             while True:
