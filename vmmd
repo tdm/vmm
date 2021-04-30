@@ -1006,7 +1006,7 @@ class VirtualMachine(DbObject):
         fork_child(argv)
         file_wait_exists(self._qemu_pidfile(), 2.0)
         if resuming:
-            self._run_monitor_command('delvm vmm-suspend')
+            self._run_monitor_command('delvm vmm-suspend', 5.0)
         if self['vncpass']:
             self._run_monitor_command("change vnc password %s" % (self['vncpass']))
 
@@ -1017,13 +1017,15 @@ class VirtualMachine(DbObject):
         lines = buf.rstrip('\n').replace('\r', '').split('\n')
         return lines
 
-    def _run_monitor_command(self, cmd):
+    def _run_monitor_command(self, cmd, timeout=None):
+        if timeout is None:
+            timeout = 1.0
         locker = ScopedLocker(self._lock)
         vm_run_dir = "%s/%04x" % (run_dir, self['id'])
         pathname = "%s/monitor" % (vm_run_dir)
         file_wait_exists(pathname, 1.0)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(1.0)
+        sock.settimeout(timeout)
         res = []
         try:
             sock.connect(pathname)
@@ -1051,7 +1053,7 @@ class VirtualMachine(DbObject):
         self._run_monitor_command('system_reset')
 
     def suspend(self):
-        self._run_monitor_command('savevm vmm-suspend')
+        self._run_monitor_command('savevm vmm-suspend', 15.0)
         self.kill()
 
     def poweroff(self):
