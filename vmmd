@@ -302,6 +302,17 @@ def file_remove(pathname):
         if e.errno != errno.ENOENT:
             raise
 
+def file_wait_exists(pathname, timeout, msg=None):
+    if msg is None:
+        msg = "Timeout out waiting for %s" % (pathname)
+    elapsed = 0.0
+    while elapsed < timeout:
+        if os.path.exists(pathname):
+            return
+        time.sleep(0.1)
+        elapsed += 0.1
+    raise RuntimeError(msg)
+
 def image_pathname(root, name, ext):
     pathname = "%s/%s" % (root, name)
     if not pathname.endswith(ext):
@@ -993,13 +1004,7 @@ class VirtualMachine(DbObject):
         except OSError as e:
             pass
         fork_child(argv)
-        tries = 0
-        while tries < 20 and not os.path.exists(self._qemu_pidfile()):
-            tries += 1
-            time.sleep(0.1)
-        if not os.path.exists(self._qemu_pidfile()):
-            print("Timed out waiting for pidfile")
-            raise RuntimeError("Emulator failed to start")
+        file_wait_exists(self._qemu_pidfile(), 2.0)
         if resuming:
             self._run_monitor_command('delvm vmm-suspend')
         if self['vncpass']:
@@ -1015,11 +1020,13 @@ class VirtualMachine(DbObject):
     def _run_monitor_command(self, cmd):
         locker = ScopedLocker(self._lock)
         vm_run_dir = "%s/%04x" % (run_dir, self['id'])
+        pathname = "%s/monitor" % (vm_run_dir)
+        file_wait_exists(pathname, 1.0)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(1.0)
         res = []
         try:
-            sock.connect("%s/monitor" % (vm_run_dir))
+            sock.connect(pathname)
             self._drain_monitor_socket(sock)
             line = cmd
             if not line.endswith('\n'):
