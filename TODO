@@ -9,6 +9,8 @@ Need to do
  - Finish API implementation
  - Security checks for all operations
  - Detect in-use images by looking for vmdisk backing files
+ - VNC encryption
+ - Console encryption and ditch CLI
 
 Might do
 ========
