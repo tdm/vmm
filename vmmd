@@ -509,6 +509,13 @@ def sig_term(signum, frame):
     global running
     running = False
 
+def sig_chld(signum, frame):
+    try:
+        while True:
+            (pid, status) = os.waitpid(0, os.WNOHANG)
+    except:
+        pass
+
 ### Config ###
 
 class Config:
@@ -2557,6 +2564,7 @@ for entry in os.listdir(run_dir):
 
 signal.signal(signal.SIGTERM, sig_term)
 signal.signal(signal.SIGINT, sig_term)
+signal.signal(signal.SIGCHLD, sig_chld)
 
 file_copier_thread = threading.Thread(target=file_copier)
 file_copier_thread.daemon = True
