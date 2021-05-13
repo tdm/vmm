@@ -795,7 +795,7 @@ class VirtualMachine(DbObject):
     def __init__(self, row):
         DbObject.__init__(self, row)
         self._lock = threading.Lock()
-        if self['macaddr'] is None:
+        if self.get('macaddr', None) is None:
             found = False
             while not found:
                 b4 = int(random.random() * 256)
@@ -807,9 +807,9 @@ class VirtualMachine(DbObject):
                 if not row:
                     found = True
             self['macaddr'] = macaddr
-        if self['vncpass'] is None:
+        if self.get('vncpass', None) is None:
             self['vncpass'] = pwgen(8)
-        if self['uuid'] is None:
+        if self.get('uuid', None) is None:
             f1 = "%08x" % (int(random.random() * (1 << 32)))
             f2 = "%04x" % (int(random.random() * (1 << 16)))
             f3 = "%04x" % (int(random.random() * (1 << 16)))
@@ -836,7 +836,7 @@ class VirtualMachine(DbObject):
         cmd_run(argv)
         return VirtualMachine({'name': name, 'owner': owner['name'],
                                'arch': arch, 'cpus': cpus, 'mem': mem,
-                               'diskpath': diskpath, 'macaddr': None, 'vncpass': None})
+                               'diskpath': diskpath})
 
     @staticmethod
     def create_from_image(name, owner, arch, cpus, mem, image_id):
@@ -853,14 +853,12 @@ class VirtualMachine(DbObject):
             acp_queue(img['pathname'], diskpath)
         return VirtualMachine({'name': name, 'owner': owner['name'],
                                'arch': arch, 'cpus': cpus, 'mem': mem,
-                               'vncpass': None, 'macaddr': None,
                                'diskpath': diskpath})
 
     @staticmethod
     def create_from_local(name, owner, arch, cpus, mem, pathname):
         return VirtualMachine({'name': name, 'owner': owner['name'],
                                'arch': arch, 'cpus': cpus, 'mem': mem,
-                               'vncpass': None, 'macaddr': None,
                                'diskpath': pathname})
 
     @staticmethod
@@ -880,7 +878,7 @@ class VirtualMachine(DbObject):
         diskpath = VirtualMachine.pathname_for_disk(owner.name(), name, ext)
         if os.path.exists(diskpath):
             raise RuntimeError("Disk already exists")
-        vm = VirtualMachine(None, name, owner, arch, cpus, mem, None, None, diskpath)
+        vm = VirtualMachine.create_from_local(name, owner, arch, cpus, mem, diskpath)
         acp_queue(image_url, diskpath)
         return vm
 
