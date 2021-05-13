@@ -809,6 +809,13 @@ class VirtualMachine(DbObject):
             self['macaddr'] = macaddr
         if self['vncpass'] is None:
             self['vncpass'] = pwgen(8)
+        if self['uuid'] is None:
+            f1 = "%08x" % (int(random.random() * (1 << 32)))
+            f2 = "%04x" % (int(random.random() * (1 << 16)))
+            f3 = "%04x" % (int(random.random() * (1 << 16)))
+            f4 = "%04x" % (int(random.random() * (1 << 16)))
+            f5 = "%012x" % (int(random.random() * (1 << 48)))
+            self['uuid'] = "%s-%s-%s-%s-%s" % (f1, f2, f3, f4, f5)
         (self._disk_psize, self._disk_vsize, self._disk_fmt) = image_info(self['diskpath'])
         self._copy_status = None
 
@@ -997,6 +1004,7 @@ class VirtualMachine(DbObject):
                 '-monitor', "unix:%s/monitor,server,nowait" % (vm_run_dir),
                 '-serial', "unix:%s/serial,server,nowait" % (vm_run_dir),
                 '-vnc', ":%d,password=on" % (self['id']),
+                '-smbios', "type=1,uuid=%s" % (self['uuid']),
                 '-drive', "file=%s%s" % (self['diskpath'], blkopt)])
         if has_pci:
             argv.extend(['-netdev', "bridge,br=%s,id=net1" % (config['network.bridge.name']),
@@ -2456,6 +2464,7 @@ vms_table = DbTable(dbconn, 'vms',
    mem         INTEGER,
    ostype      VARCHAR(64),
    vncpass     CHAR(8),
+   uuid        CHAR(36),
    macaddr     CHAR(17),
    disksize    INTEGER,
    diskpath    VARCHAR(256),
