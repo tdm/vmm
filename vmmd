@@ -1971,7 +1971,7 @@ class HttpClientRequestHandler(http.server.BaseHTTPRequestHandler):
                     r += '<input type="checkbox" name="readonly">Read only mode\n'
                 r += '    <tr><td colspan="2"><input style="color:red" type="submit" name="action" value="Delete">\n'
                 r += '    <tr><td colspan="2"><hr>\n'
-                r += '    <tr><td style="font-size:125%">Create image from disk<td>&nbsp;\n'
+                r += '    <tr><td colspan="2" style="font-size:125%">Create image from disk\n'
                 r += '    <tr><td style="font-weight:bold">Name<td><input type="text" name="image_name">\n'
                 r += '    <tr><td>&nbsp;<td><input type="checkbox" name="image_public">Public\n'
                 r += '    <tr><td colspan="2"><input type="submit" name="action" value="Create Image">\n'
