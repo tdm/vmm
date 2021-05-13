@@ -988,6 +988,7 @@ class VirtualMachine(DbObject):
             raise RuntimeError('Unknown arch')
         argv = [prog]
         argv.extend(['-daemonize', '-pidfile', self._qemu_pidfile()])
+        argv.extend(['-name', self['name']])
         argv.extend(['-machine', machine_arg, '-cpu', cpu_arg])
         ethdev = 'virtio-net' if self['ostype'] == 'linux' else 'e1000'
         blkopt = ''
