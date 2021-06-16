@@ -1021,8 +1021,11 @@ class VirtualMachine(DbObject):
             pass
         fork_child(argv)
         file_wait_exists(self._qemu_pidfile(), 2.0)
+        res = self._run_monitor_command('info status', 30.0)
+        if not res:
+            loge('Failed to communicate with monitor')
         if resuming:
-            self._run_monitor_command('delvm vmm-suspend', 5.0)
+            self._run_monitor_command('delvm vmm-suspend')
         if self['vncpass']:
             self._run_monitor_command("change vnc password %s" % (self['vncpass']))
 
